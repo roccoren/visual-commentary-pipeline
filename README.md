@@ -2,6 +2,11 @@
 
 Standalone Python project for generating a **基于视频画面的中文讲解版** from a deck recording, UI walkthrough, or product demo video.
 
+## Documentation
+
+- [Solution principles and architecture diagram](docs/solution-principles-zh.md) (Chinese)
+- [Parameter tuning guide](docs/parameter-tuning-guide-zh.md) (Chinese)
+
 ## What it does
 
 1. Detect visual segments from the input video via ffmpeg scene detection.
