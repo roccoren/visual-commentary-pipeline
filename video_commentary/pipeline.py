@@ -34,6 +34,7 @@ from .core import (
     write_srt_file,
 )
 from .duration_policy import decide_duration_action
+from .qa_gate import evaluate_narration_quality
 from .segment_policy import decide_segment_action
 from .state import Decision, Manifest, RetryEntry, SegmentState, SegmentStatus
 
@@ -674,6 +675,30 @@ def run_narration_step(segment: SegmentState) -> None:
     segment.status = SegmentStatus.CONTENT_GENERATED
 
 
+def run_qa_gate_step(manifest: Manifest, segment: SegmentState) -> None:
+    qa_result = evaluate_narration_quality(
+        narration=segment.selected_draft,
+        previous_narration=get_previous_accepted_narration(manifest, segment.id),
+        duration_seconds=segment.duration,
+    )
+    segment.critic_feedback = qa_result.feedback
+    if qa_result.passed:
+        return
+
+    note_segment_decision(
+        segment,
+        decision=qa_result.decision,
+        reason=qa_result.reason,
+        details=qa_result.details,
+    )
+    if qa_result.decision == Decision.RETRY_NARRATION:
+        segment.status = SegmentStatus.NEEDS_HUMAN_REVIEW
+        segment.human_review_status = "qa-retry-narration"
+    else:
+        segment.status = SegmentStatus.NEEDS_HUMAN_REVIEW
+        segment.human_review_status = "qa-human-review"
+
+
 def run_tts_step(
     segment: SegmentState,
     *,
@@ -766,6 +791,8 @@ def process_segment(
             run_vision_step(manifest, segment)
             manifest.save(manifest_path)
             run_narration_step(segment)
+            manifest.save(manifest_path)
+            run_qa_gate_step(manifest, segment)
             manifest.save(manifest_path)
 
         if segment.status == SegmentStatus.CONTENT_GENERATED:

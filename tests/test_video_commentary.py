@@ -25,9 +25,11 @@ from video_commentary.pipeline import (
     get_previous_segment,
     note_segment_decision,
     reset_segment_for_redo,
+    run_qa_gate_step,
     segment_state_to_narration,
     should_process_segment,
 )
+from video_commentary.qa_gate import evaluate_narration_quality
 from video_commentary.segment_policy import decide_segment_action
 from video_commentary.state import Decision, Manifest, RetryEntry, SegmentState, SegmentStatus
 
@@ -348,6 +350,67 @@ class TestDecisionHelpers:
         assert segment.decision_reason == "need better timing"
         assert segment.retry_history[-1].action == Decision.RETRY_TTS
         assert segment.retry_history[-1].details == {"gap_ms": 420}
+
+
+class TestQAGate:
+    def test_empty_narration_requests_retry(self):
+        result = evaluate_narration_quality(narration="   ", previous_narration="上一段", duration_seconds=5.0)
+        assert result.passed is False
+        assert result.decision == Decision.RETRY_NARRATION
+        assert "empty narration" in result.feedback
+
+    def test_repetitive_narration_requests_retry(self):
+        result = evaluate_narration_quality(
+            narration="这里展示 Azure 门户。",
+            previous_narration="这里展示Azure门户。",
+            duration_seconds=5.0,
+        )
+        assert result.passed is False
+        assert result.decision == Decision.RETRY_NARRATION
+        assert "repetitive narration" in result.feedback
+
+    def test_too_dense_narration_requests_retry_or_review(self):
+        retry_result = evaluate_narration_quality(
+            narration="这是一段明显过长的讲解文案" * 5,
+            previous_narration="上一段不同内容",
+            duration_seconds=6.0,
+        )
+        review_result = evaluate_narration_quality(
+            narration="极其冗长的讲解文案" * 10,
+            previous_narration="上一段不同内容",
+            duration_seconds=4.0,
+        )
+        assert retry_result.passed is False
+        assert retry_result.decision == Decision.RETRY_NARRATION
+        assert review_result.passed is False
+        assert review_result.decision == Decision.NEEDS_HUMAN_REVIEW
+
+    def test_run_qa_gate_step_records_feedback_on_segment(self):
+        manifest = Manifest(
+            version="2.0",
+            input_video="in.mp4",
+            output_video="out.mp4",
+            workdir="/tmp/work",
+            scene_threshold=0.32,
+            min_segment=3.0,
+            max_segment=12.0,
+            segment_buffer=0.35,
+            base_rate="+0%",
+            azure_style="professional",
+            duration=20.0,
+            segments=[
+                SegmentState(id=1, start=0.0, end=4.0, duration=4.0, status=SegmentStatus.ACCEPTED, selected_draft="上一段"),
+                SegmentState(id=2, start=4.0, end=8.0, duration=4.0, status=SegmentStatus.CONTENT_GENERATED, selected_draft="上一段"),
+            ],
+        )
+        segment = manifest.segments[1]
+
+        run_qa_gate_step(manifest, segment)
+
+        assert segment.status == SegmentStatus.NEEDS_HUMAN_REVIEW
+        assert segment.decision == Decision.RETRY_NARRATION
+        assert segment.human_review_status == "qa-retry-narration"
+        assert "repetitive narration" in segment.critic_feedback
 
 
 class TestPolicies:
