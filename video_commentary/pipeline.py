@@ -11,7 +11,7 @@ import shutil
 import subprocess
 import textwrap
 from pathlib import Path
-from typing import List
+from typing import Any, List
 
 import requests
 
@@ -139,6 +139,100 @@ def image_to_data_url(path: Path) -> str:
     return f"data:{mime};base64,{data}"
 
 
+def azure_openai_uses_responses_api(api_version: str) -> bool:
+    match = re.match(r"(\d{4}-\d{2}-\d{2})", api_version)
+    if not match:
+        return False
+    return match.group(1) >= "2025-04-01"
+
+
+def build_azure_openai_vision_request(
+    *,
+    endpoint: str,
+    deployment: str,
+    api_version: str,
+    user_prompt: str,
+    frame_paths: List[Path],
+) -> tuple[str, dict[str, Any], str]:
+    if azure_openai_uses_responses_api(api_version):
+        content = [{"type": "input_text", "text": user_prompt}]
+        for path in frame_paths:
+            content.append(
+                {
+                    "type": "input_image",
+                    "image_url": image_to_data_url(path),
+                    "detail": "low",
+                }
+            )
+
+        payload = {
+            "model": deployment,
+            "instructions": "你是擅长做产品演示和 slide 视频重述的中文讲解编辑。输出必须是有效 JSON。",
+            "input": [{"type": "message", "role": "user", "content": content}],
+            "temperature": 0.2,
+            "max_output_tokens": 900,
+            "text": {"format": {"type": "json_object"}},
+        }
+        return f"{endpoint}/openai/responses?api-version={api_version}", payload, "responses"
+
+    content = [{"type": "text", "text": user_prompt}]
+    for path in frame_paths:
+        content.append(
+            {
+                "type": "image_url",
+                "image_url": {"url": image_to_data_url(path), "detail": "low"},
+            }
+        )
+
+    payload = {
+        "messages": [
+            {
+                "role": "system",
+                "content": "你是擅长做产品演示和 slide 视频重述的中文讲解编辑。输出必须是有效 JSON。",
+            },
+            {"role": "user", "content": content},
+        ],
+        "temperature": 0.2,
+        "max_tokens": 900,
+    }
+    return (
+        f"{endpoint}/openai/deployments/{deployment}/chat/completions?api-version={api_version}",
+        payload,
+        "chat_completions",
+    )
+
+
+def extract_azure_openai_text(response_body: dict[str, Any], api_kind: str) -> str:
+    if api_kind == "responses":
+        output_text = response_body.get("output_text")
+        if isinstance(output_text, str) and output_text.strip():
+            return output_text
+
+        for item in response_body.get("output", []):
+            if item.get("type") != "message" or item.get("role") != "assistant":
+                continue
+            parts = []
+            for content in item.get("content", []):
+                if content.get("type") == "output_text" and isinstance(content.get("text"), str):
+                    parts.append(content["text"])
+            if parts:
+                return "".join(parts)
+        raise RuntimeError(f"Responses API did not return assistant text: {json.dumps(response_body, ensure_ascii=False)[:1000]}")
+
+    return response_body["choices"][0]["message"]["content"]
+
+
+def raise_for_status_with_context(response: requests.Response) -> None:
+    try:
+        response.raise_for_status()
+    except requests.HTTPError as exc:
+        detail = (response.text or "").strip()
+        suffix = f" Response: {detail[:2000]}" if detail else ""
+        raise RuntimeError(
+            f"Azure OpenAI request failed with status {response.status_code} for {response.url}.{suffix}"
+        ) from exc
+
+
 def call_azure_openai_vision(*, frame_paths: List[Path], segment: Segment, previous_narration: str) -> dict:
     endpoint = env_required("AZURE_OPENAI_ENDPOINT").rstrip("/")
     api_key = env_required("AZURE_OPENAI_API_KEY")
@@ -171,35 +265,21 @@ def call_azure_openai_vision(*, frame_paths: List[Path], segment: Segment, previ
         """
     ).strip()
 
-    content = [{"type": "text", "text": user_prompt}]
-    for path in frame_paths:
-        content.append(
-            {
-                "type": "image_url",
-                "image_url": {"url": image_to_data_url(path), "detail": "low"},
-            }
-        )
-
-    payload = {
-        "messages": [
-            {
-                "role": "system",
-                "content": "你是擅长做产品演示和 slide 视频重述的中文讲解编辑。输出必须是有效 JSON。",
-            },
-            {"role": "user", "content": content},
-        ],
-        "temperature": 0.2,
-        "max_tokens": 900,
-    }
-    url = f"{endpoint}/openai/deployments/{deployment}/chat/completions?api-version={api_version}"
+    url, payload, api_kind = build_azure_openai_vision_request(
+        endpoint=endpoint,
+        deployment=deployment,
+        api_version=api_version,
+        user_prompt=user_prompt,
+        frame_paths=frame_paths,
+    )
     response = requests.post(
         url,
         headers={"api-key": api_key, "Content-Type": "application/json"},
         json=payload,
         timeout=180,
     )
-    response.raise_for_status()
-    raw = response.json()["choices"][0]["message"]["content"]
+    raise_for_status_with_context(response)
+    raw = extract_azure_openai_text(response.json(), api_kind)
 
     try:
         parsed = json.loads(raw)

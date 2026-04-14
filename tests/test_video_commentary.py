@@ -13,6 +13,11 @@ from video_commentary.core import (
     normalize_terms,
     sample_times,
 )
+from video_commentary.pipeline import (
+    azure_openai_uses_responses_api,
+    build_azure_openai_vision_request,
+    extract_azure_openai_text,
+)
 
 
 class TestBuildSegments:
@@ -117,4 +122,79 @@ class TestAzureSsml:
         assert "mstts:audioduration" not in ssml
         assert "mstts:express-as" not in ssml
         assert "<prosody rate=\"+0%\">讲解内容</prosody>" in ssml
+
+
+class TestAzureOpenAIRequestRouting:
+    def test_uses_responses_api_for_2025_preview(self, tmp_path: Path):
+        frame = tmp_path / "frame.jpg"
+        frame.write_bytes(b"fake-jpeg")
+
+        url, payload, api_kind = build_azure_openai_vision_request(
+            endpoint="https://example.openai.azure.com",
+            deployment="gpt-5.4-nano",
+            api_version="2025-04-01-preview",
+            user_prompt="describe the frame",
+            frame_paths=[frame],
+        )
+
+        assert azure_openai_uses_responses_api("2025-04-01-preview") is True
+        assert api_kind == "responses"
+        assert url == "https://example.openai.azure.com/openai/responses?api-version=2025-04-01-preview"
+        assert payload["model"] == "gpt-5.4-nano"
+        assert payload["input"][0]["content"][0] == {"type": "input_text", "text": "describe the frame"}
+        assert payload["input"][0]["content"][1]["type"] == "input_image"
+
+    def test_uses_chat_completions_for_2024_api(self, tmp_path: Path):
+        frame = tmp_path / "frame.png"
+        frame.write_bytes(b"fake-png")
+
+        url, payload, api_kind = build_azure_openai_vision_request(
+            endpoint="https://example.openai.azure.com",
+            deployment="gpt-4o-mini",
+            api_version="2024-10-21",
+            user_prompt="describe the frame",
+            frame_paths=[frame],
+        )
+
+        assert azure_openai_uses_responses_api("2024-10-21") is False
+        assert api_kind == "chat_completions"
+        assert url == (
+            "https://example.openai.azure.com/openai/deployments/gpt-4o-mini/"
+            "chat/completions?api-version=2024-10-21"
+        )
+        assert payload["messages"][1]["content"][0] == {"type": "text", "text": "describe the frame"}
+        assert payload["messages"][1]["content"][1]["type"] == "image_url"
+
+
+class TestAzureOpenAIResponseParsing:
+    def test_extracts_output_text_from_responses_api(self):
+        body = {
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": '{"narration_zh": "这里展示了 Azure 门户。"}',
+                        }
+                    ],
+                }
+            ]
+        }
+
+        assert extract_azure_openai_text(body, "responses") == '{"narration_zh": "这里展示了 Azure 门户。"}'
+
+    def test_extracts_message_content_from_chat_completions(self):
+        body = {
+            "choices": [
+                {
+                    "message": {
+                        "content": '{"narration_zh": "这里继续演示配置过程。"}'
+                    }
+                }
+            ]
+        }
+
+        assert extract_azure_openai_text(body, "chat_completions") == '{"narration_zh": "这里继续演示配置过程。"}'
 
