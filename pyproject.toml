@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "visual-commentary-pipeline"
+version = "0.1.0"
+description = "Standalone visual-first Azure OpenAI + Azure Speech video commentary pipeline"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "Rocco" }]
+license = { text = "MIT" }
+dependencies = [
+  "requests>=2.31,<3",
+  "imageio-ffmpeg>=0.6,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8,<9",
+]
+
+[project.scripts]
+visual-commentary = "video_commentary.pipeline:main"
+
+[tool.setuptools.packages.find]
+include = ["video_commentary", "video_commentary.*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
