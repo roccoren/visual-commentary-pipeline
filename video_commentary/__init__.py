@@ -14,11 +14,16 @@ from .core import (
     serialize_manifest,
     write_srt_file,
 )
+from .state import Decision, Manifest, SegmentState, SegmentStatus
 
 __all__ = [
     "DEFAULT_TERM_MAP",
+    "Decision",
+    "Manifest",
     "Segment",
     "SegmentNarration",
+    "SegmentState",
+    "SegmentStatus",
     "atempo_chain",
     "build_azure_tts_ssml",
     "build_segments",

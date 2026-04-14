@@ -31,14 +31,17 @@ from .core import (
     build_segments,
     normalize_terms,
     sample_times,
-    serialize_manifest,
     write_srt_file,
 )
+from .duration_policy import decide_duration_action
+from .segment_policy import decide_segment_action
+from .state import Decision, Manifest, RetryEntry, SegmentState, SegmentStatus
 
 DEFAULT_AZURE_OPENAI_API_VERSION = "2024-10-21"
 DEFAULT_AZURE_SPEECH_VOICE = "zh-CN-XiaoxiaoNeural"
 DEFAULT_AZURE_SPEECH_STYLE = "professional"
 DEFAULT_OUTPUT_AUDIO_FORMAT = "audio-24khz-96kbitrate-mono-mp3"
+MANIFEST_VERSION = "2.0"
 
 
 def env_required(name: str) -> str:
@@ -233,7 +236,7 @@ def raise_for_status_with_context(response: requests.Response) -> None:
         ) from exc
 
 
-def call_azure_openai_vision(*, frame_paths: List[Path], segment: Segment, previous_narration: str) -> dict:
+def call_azure_openai_vision(*, frame_paths: List[Path], segment: SegmentState, previous_narration: str) -> dict:
     endpoint = env_required("AZURE_OPENAI_ENDPOINT").rstrip("/")
     api_key = env_required("AZURE_OPENAI_API_KEY")
     deployment = env_required("AZURE_OPENAI_DEPLOYMENT")
@@ -466,6 +469,420 @@ def mux_video(ffmpeg_bin: str, video_path: Path, commentary_audio: Path, srt_pat
     )
 
 
+def segment_state_to_narration(segment: SegmentState) -> SegmentNarration:
+    return SegmentNarration(
+        id=segment.id,
+        start=segment.start,
+        end=segment.end,
+        duration=segment.duration,
+        title=segment.title,
+        visible_points=segment.visible_points,
+        on_screen_text=segment.on_screen_text,
+        narration_zh=segment.selected_draft,
+        frame_paths=segment.frame_paths,
+        audio_path=segment.raw_audio_path,
+        audio_duration=round(segment.raw_audio_duration, 3),
+        fitted_audio_path=segment.fitted_audio_path,
+        fitted_audio_duration=round(segment.fitted_audio_duration, 3),
+    )
+
+
+def build_manifest(
+    args: argparse.Namespace,
+    *,
+    input_video: Path,
+    output_video: Path,
+    workdir: Path,
+    duration: float,
+    segments: List[Segment],
+) -> Manifest:
+    return Manifest(
+        version=MANIFEST_VERSION,
+        input_video=str(input_video),
+        output_video=str(output_video),
+        workdir=str(workdir),
+        scene_threshold=args.scene_threshold,
+        min_segment=args.min_segment,
+        max_segment=args.max_segment,
+        segment_buffer=args.segment_buffer,
+        base_rate=args.base_rate,
+        azure_style=args.azure_style,
+        duration=round(duration, 3),
+        status="planned",
+        artifacts={},
+        segments=[
+            SegmentState.from_segment(
+                seg_id=segment.id,
+                start=segment.start,
+                end=segment.end,
+                duration=segment.duration,
+            )
+            for segment in segments
+        ],
+    )
+
+
+def accepted_segments_from_manifest(manifest: Manifest) -> list[SegmentState]:
+    return [
+        segment
+        for segment in manifest.segments
+        if segment.status == SegmentStatus.ACCEPTED and segment.fitted_audio_path and segment.selected_draft
+    ]
+
+
+def accepted_narrations_from_manifest(manifest: Manifest) -> list[SegmentNarration]:
+    return [segment_state_to_narration(segment) for segment in accepted_segments_from_manifest(manifest)]
+
+
+def get_previous_segment(manifest: Manifest, segment_id: int) -> SegmentState | None:
+    previous: SegmentState | None = None
+    for segment in manifest.segments:
+        if segment.id == segment_id:
+            return previous
+        previous = segment
+    return previous
+
+
+def get_previous_accepted_narration(manifest: Manifest, segment_id: int) -> str:
+    previous_text = ""
+    for segment in manifest.segments:
+        if segment.id == segment_id:
+            return previous_text
+        if segment.status == SegmentStatus.ACCEPTED and segment.selected_draft:
+            previous_text = segment.selected_draft
+    return previous_text
+
+
+def should_process_segment(segment: SegmentState, *, redo: str | None, target_segment_id: int | None) -> bool:
+    if target_segment_id is not None and segment.id != target_segment_id:
+        return False
+    if redo:
+        return True
+    return segment.status not in {SegmentStatus.ACCEPTED, SegmentStatus.SKIPPED}
+
+
+def clear_segment_outputs(segment: SegmentState) -> None:
+    segment.raw_audio_path = ""
+    segment.raw_audio_duration = 0.0
+    segment.fitted_audio_path = ""
+    segment.fitted_audio_duration = 0.0
+    segment.duration_gap_ms = 0
+    segment.decision = None
+    segment.decision_reason = ""
+    segment.errors = []
+    segment.human_review_status = ""
+
+
+def reset_segment_for_redo(segment: SegmentState, redo: str) -> None:
+    if redo == "vision":
+        segment.status = SegmentStatus.PENDING
+        segment.frame_paths = []
+        segment.title = ""
+        segment.visible_points = []
+        segment.on_screen_text = []
+        segment.vision_result = {}
+        segment.draft_candidates = []
+        segment.selected_draft = ""
+        segment.critic_feedback = []
+        clear_segment_outputs(segment)
+    elif redo == "narration":
+        segment.status = SegmentStatus.FRAMES_EXTRACTED
+        segment.title = ""
+        segment.visible_points = []
+        segment.on_screen_text = []
+        segment.vision_result = {}
+        segment.draft_candidates = []
+        segment.selected_draft = ""
+        segment.critic_feedback = []
+        clear_segment_outputs(segment)
+    elif redo == "tts":
+        segment.status = SegmentStatus.CONTENT_GENERATED
+        clear_segment_outputs(segment)
+
+
+def note_segment_decision(
+    segment: SegmentState,
+    *,
+    decision: Decision,
+    reason: str,
+    details: dict[str, Any] | None = None,
+) -> None:
+    segment.decision = decision
+    segment.decision_reason = reason
+    segment.retry_history.append(
+        RetryEntry(
+            action=decision,
+            reason=reason,
+            details=details or {},
+        )
+    )
+
+
+def run_boundary_step(manifest: Manifest, segment: SegmentState, *, manifest_path: Path) -> bool:
+    boundary = decide_segment_action(segment, previous_segment=get_previous_segment(manifest, segment.id))
+    if boundary.decision == Decision.SKIP_SEGMENT:
+        segment.status = SegmentStatus.SKIPPED
+        note_segment_decision(segment, decision=boundary.decision, reason=boundary.reason)
+        manifest.save(manifest_path)
+        return False
+
+    if boundary.decision == Decision.MERGE_WITH_PREVIOUS:
+        segment.status = SegmentStatus.NEEDS_HUMAN_REVIEW
+        segment.human_review_status = "pending-merge-review"
+        note_segment_decision(segment, decision=boundary.decision, reason=boundary.reason)
+        manifest.save(manifest_path)
+        return False
+
+    return True
+
+
+def run_frame_extraction_step(
+    segment: SegmentState,
+    *,
+    input_video: Path,
+    frames_dir: Path,
+    ffmpeg_bin: str,
+) -> None:
+    seg_dir = frames_dir / f"seg_{segment.id:03d}"
+    seg_dir.mkdir(exist_ok=True)
+    frame_paths: List[str] = []
+    samples = sample_times(Segment(id=segment.id, start=segment.start, end=segment.end, duration=segment.duration))
+    for index, timestamp in enumerate(samples, start=1):
+        frame_path = seg_dir / f"frame_{index:02d}.jpg"
+        extract_frame(ffmpeg_bin, input_video, timestamp, frame_path)
+        frame_paths.append(str(frame_path))
+    segment.frame_paths = frame_paths
+    segment.status = SegmentStatus.FRAMES_EXTRACTED
+
+
+def run_vision_step(manifest: Manifest, segment: SegmentState) -> None:
+    vision = call_azure_openai_vision(
+        frame_paths=[Path(path) for path in segment.frame_paths],
+        segment=segment,
+        previous_narration=get_previous_accepted_narration(manifest, segment.id),
+    )
+    segment.vision_result = vision
+    segment.title = vision["title"]
+    segment.visible_points = vision["visible_points"]
+    segment.on_screen_text = vision["on_screen_text"]
+
+
+def run_narration_step(segment: SegmentState) -> None:
+    narration = normalize_terms(str(segment.vision_result.get("narration_zh", "这里展示了当前画面的核心内容。")))
+    segment.draft_candidates = [narration]
+    segment.selected_draft = narration
+    segment.status = SegmentStatus.CONTENT_GENERATED
+
+
+def run_tts_step(
+    segment: SegmentState,
+    *,
+    raw_audio_dir: Path,
+    fit_audio_dir: Path,
+    ffmpeg_bin: str,
+    ffprobe_bin: str,
+    base_rate: str,
+    azure_style: str,
+    segment_buffer: float,
+) -> None:
+    raw_audio = raw_audio_dir / f"seg_{segment.id:03d}.mp3"
+    fitted_audio = fit_audio_dir / f"seg_{segment.id:03d}.mp3"
+    target_duration_ms = int(max(800, round((segment.duration - segment_buffer) * 1000)))
+    synthesize_azure_tts(
+        segment.selected_draft,
+        raw_audio,
+        voice=os.getenv("AZURE_SPEECH_VOICE", DEFAULT_AZURE_SPEECH_VOICE),
+        rate=base_rate,
+        target_duration_ms=target_duration_ms,
+        style=azure_style,
+    )
+    raw_duration = ffprobe_duration(ffprobe_bin, raw_audio)
+    budget_seconds = max(0.8, segment.duration - segment_buffer)
+    fitted_duration = fit_audio_to_budget(
+        ffmpeg_bin,
+        ffprobe_bin,
+        raw_audio,
+        fitted_audio,
+        budget_seconds=budget_seconds,
+    )
+    segment.raw_audio_path = str(raw_audio)
+    segment.raw_audio_duration = round(raw_duration, 3)
+    segment.fitted_audio_path = str(fitted_audio)
+    segment.fitted_audio_duration = round(fitted_duration, 3)
+    segment.duration_budget = round(budget_seconds, 3)
+    segment.status = SegmentStatus.TTS_GENERATED
+
+
+def run_duration_gate_step(segment: SegmentState) -> None:
+    duration_decision = decide_duration_action(
+        budget_seconds=segment.duration_budget,
+        fitted_duration_seconds=segment.fitted_audio_duration,
+    )
+    segment.duration_gap_ms = duration_decision.gap_ms
+    note_segment_decision(
+        segment,
+        decision=duration_decision.decision,
+        reason=duration_decision.reason,
+        details={
+            "budget_seconds": segment.duration_budget,
+            "fitted_duration_seconds": segment.fitted_audio_duration,
+            "gap_ms": duration_decision.gap_ms,
+        },
+    )
+    if duration_decision.decision == Decision.ACCEPT:
+        segment.status = SegmentStatus.ACCEPTED
+    else:
+        segment.status = SegmentStatus.NEEDS_HUMAN_REVIEW
+        segment.human_review_status = "timing-adjustment-needed"
+
+
+def process_segment(
+    manifest: Manifest,
+    segment: SegmentState,
+    *,
+    input_video: Path,
+    frames_dir: Path,
+    raw_audio_dir: Path,
+    fit_audio_dir: Path,
+    ffmpeg_bin: str,
+    ffprobe_bin: str,
+    args: argparse.Namespace,
+    manifest_path: Path,
+) -> None:
+    if not run_boundary_step(manifest, segment, manifest_path=manifest_path):
+        return
+
+    try:
+        if segment.status == SegmentStatus.PENDING:
+            run_frame_extraction_step(
+                segment,
+                input_video=input_video,
+                frames_dir=frames_dir,
+                ffmpeg_bin=ffmpeg_bin,
+            )
+            manifest.save(manifest_path)
+
+        if segment.status == SegmentStatus.FRAMES_EXTRACTED:
+            run_vision_step(manifest, segment)
+            manifest.save(manifest_path)
+            run_narration_step(segment)
+            manifest.save(manifest_path)
+
+        if segment.status == SegmentStatus.CONTENT_GENERATED:
+            run_tts_step(
+                segment,
+                raw_audio_dir=raw_audio_dir,
+                fit_audio_dir=fit_audio_dir,
+                ffmpeg_bin=ffmpeg_bin,
+                ffprobe_bin=ffprobe_bin,
+                base_rate=args.base_rate,
+                azure_style=args.azure_style,
+                segment_buffer=args.segment_buffer,
+            )
+            manifest.save(manifest_path)
+
+        if segment.status == SegmentStatus.TTS_GENERATED:
+            run_duration_gate_step(segment)
+            manifest.save(manifest_path)
+
+    except Exception as exc:
+        segment.status = SegmentStatus.FAILED
+        segment.errors.append(str(exc))
+        manifest.save(manifest_path)
+        raise
+
+
+def finalize_outputs(manifest: Manifest, *, ffmpeg_bin: str, output_video: Path, workdir: Path) -> dict[str, Any]:
+    narrations = accepted_narrations_from_manifest(manifest)
+
+    srt_path = workdir / "commentary_zh.srt"
+    audio_mix_path = workdir / "commentary_zh.m4a"
+    manifest_path = workdir / "commentary_manifest.json"
+
+    write_srt_file(narrations, srt_path)
+    compose_commentary_track(
+        ffmpeg_bin,
+        narrations,
+        full_duration=manifest.duration,
+        out_audio=audio_mix_path,
+        temp_dir=workdir,
+    )
+    output_video.parent.mkdir(parents=True, exist_ok=True)
+    mux_video(ffmpeg_bin, Path(manifest.input_video), audio_mix_path, srt_path, output_video)
+
+    manifest.artifacts.update(
+        {
+            "manifest": str(manifest_path),
+            "srt": str(srt_path),
+            "audio": str(audio_mix_path),
+            "output_video": str(output_video),
+        }
+    )
+    manifest.status = "completed"
+    manifest.save(manifest_path)
+    return {
+        "input_video": manifest.input_video,
+        "output_video": str(output_video),
+        "manifest": str(manifest_path),
+        "srt": str(srt_path),
+        "audio": str(audio_mix_path),
+        "segments": len(narrations),
+        "duration": round(manifest.duration, 3),
+        "needs_review": len(
+            [segment for segment in manifest.segments if segment.status == SegmentStatus.NEEDS_HUMAN_REVIEW]
+        ),
+    }
+
+
+def load_or_create_manifest(
+    args: argparse.Namespace,
+    *,
+    input_video: Path,
+    output_video: Path,
+    workdir: Path,
+    ffmpeg_bin: str,
+    ffprobe_bin: str,
+    manifest_path: Path,
+) -> Manifest:
+    if args.resume_from_manifest:
+        return Manifest.load(Path(args.resume_from_manifest).expanduser().resolve())
+    if manifest_path.exists() and not args.force_replan:
+        return Manifest.load(manifest_path)
+
+    duration = ffprobe_duration(ffprobe_bin, input_video)
+    cuts = detect_scene_cuts(ffmpeg_bin, input_video, args.scene_threshold)
+    segments = build_segments(
+        duration,
+        cuts,
+        min_segment=args.min_segment,
+        max_segment=args.max_segment,
+    )
+    manifest = build_manifest(
+        args,
+        input_video=input_video,
+        output_video=output_video,
+        workdir=workdir,
+        duration=duration,
+        segments=segments,
+    )
+    manifest.save(manifest_path)
+    return manifest
+
+
+def maybe_apply_redo(manifest: Manifest, args: argparse.Namespace, *, manifest_path: Path) -> None:
+    if args.segment_id is None or args.redo is None:
+        return
+
+    target = manifest.get_segment(args.segment_id)
+    reset_segment_for_redo(target, args.redo)
+    note_segment_decision(
+        target,
+        decision=Decision.RETRY_NARRATION if args.redo in {"vision", "narration"} else Decision.RETRY_TTS,
+        reason=f"manual redo requested: {args.redo}",
+    )
+    manifest.save(manifest_path)
+
+
 def narrate_video(args: argparse.Namespace) -> dict:
     ffmpeg_bin = find_ffmpeg()
     ffprobe_bin = find_ffprobe(ffmpeg_bin)
@@ -480,98 +897,45 @@ def narrate_video(args: argparse.Namespace) -> dict:
     frames_dir.mkdir(exist_ok=True)
     raw_audio_dir.mkdir(exist_ok=True)
     fit_audio_dir.mkdir(exist_ok=True)
+    manifest_path = workdir / "commentary_manifest.json"
 
-    duration = ffprobe_duration(ffprobe_bin, input_video)
-    cuts = detect_scene_cuts(ffmpeg_bin, input_video, args.scene_threshold)
-    segments = build_segments(
-        duration,
-        cuts,
-        min_segment=args.min_segment,
-        max_segment=args.max_segment,
+    manifest = load_or_create_manifest(
+        args,
+        input_video=input_video,
+        output_video=output_video,
+        workdir=workdir,
+        ffmpeg_bin=ffmpeg_bin,
+        ffprobe_bin=ffprobe_bin,
+        manifest_path=manifest_path,
     )
+    maybe_apply_redo(manifest, args, manifest_path=manifest_path)
 
-    narrations: List[SegmentNarration] = []
-    previous_narration = ""
-    for segment in segments:
-        seg_dir = frames_dir / f"seg_{segment.id:03d}"
-        seg_dir.mkdir(exist_ok=True)
-        frame_paths: List[Path] = []
-        for index, timestamp in enumerate(sample_times(segment), start=1):
-            frame_path = seg_dir / f"frame_{index:02d}.jpg"
-            extract_frame(ffmpeg_bin, input_video, timestamp, frame_path)
-            frame_paths.append(frame_path)
+    manifest.status = "running"
+    manifest.save(manifest_path)
 
-        vision = call_azure_openai_vision(
-            frame_paths=frame_paths,
-            segment=segment,
-            previous_narration=previous_narration,
-        )
-        narration = SegmentNarration(
-            id=segment.id,
-            start=segment.start,
-            end=segment.end,
-            duration=segment.duration,
-            title=vision["title"],
-            visible_points=vision["visible_points"],
-            on_screen_text=vision["on_screen_text"],
-            narration_zh=vision["narration_zh"],
-            frame_paths=[str(path) for path in frame_paths],
-        )
+    for segment in manifest.segments:
+        if not should_process_segment(segment, redo=args.redo, target_segment_id=args.segment_id):
+            continue
 
-        raw_audio = raw_audio_dir / f"seg_{segment.id:03d}.mp3"
-        fitted_audio = fit_audio_dir / f"seg_{segment.id:03d}.mp3"
-        target_duration_ms = int(max(800, round((segment.duration - args.segment_buffer) * 1000)))
-        synthesize_azure_tts(
-            narration.narration_zh,
-            raw_audio,
-            voice=os.getenv("AZURE_SPEECH_VOICE", DEFAULT_AZURE_SPEECH_VOICE),
-            rate=args.base_rate,
-            target_duration_ms=target_duration_ms,
-            style=args.azure_style,
+        process_segment(
+            manifest,
+            segment,
+            input_video=input_video,
+            frames_dir=frames_dir,
+            raw_audio_dir=raw_audio_dir,
+            fit_audio_dir=fit_audio_dir,
+            ffmpeg_bin=ffmpeg_bin,
+            ffprobe_bin=ffprobe_bin,
+            args=args,
+            manifest_path=manifest_path,
         )
-        raw_duration = ffprobe_duration(ffprobe_bin, raw_audio)
-        fitted_duration = fit_audio_to_budget(
-            ffmpeg_bin,
-            ffprobe_bin,
-            raw_audio,
-            fitted_audio,
-            budget_seconds=max(0.8, segment.duration - args.segment_buffer),
-        )
-        narration.audio_path = str(raw_audio)
-        narration.audio_duration = round(raw_duration, 3)
-        narration.fitted_audio_path = str(fitted_audio)
-        narration.fitted_audio_duration = round(fitted_duration, 3)
-        narrations.append(narration)
-        previous_narration = narration.narration_zh
 
         print(
-            f"[segment {segment.id:03d}] {segment.start:.2f}-{segment.end:.2f}s | {narration.narration_zh}"
+            f"[segment {segment.id:03d}] {segment.start:.2f}-{segment.end:.2f}s | "
+            f"status={segment.status.value} decision={(segment.decision.value if segment.decision else 'none')}"
         )
 
-    srt_path = workdir / "commentary_zh.srt"
-    manifest_path = workdir / "commentary_manifest.json"
-    audio_mix_path = workdir / "commentary_zh.m4a"
-
-    write_srt_file(narrations, srt_path)
-    manifest_path.write_text(serialize_manifest(narrations), encoding="utf-8")
-    compose_commentary_track(
-        ffmpeg_bin,
-        narrations,
-        full_duration=duration,
-        out_audio=audio_mix_path,
-        temp_dir=workdir,
-    )
-    output_video.parent.mkdir(parents=True, exist_ok=True)
-    mux_video(ffmpeg_bin, input_video, audio_mix_path, srt_path, output_video)
-    return {
-        "input_video": str(input_video),
-        "output_video": str(output_video),
-        "manifest": str(manifest_path),
-        "srt": str(srt_path),
-        "audio": str(audio_mix_path),
-        "segments": len(narrations),
-        "duration": round(duration, 3),
-    }
+    return finalize_outputs(manifest, ffmpeg_bin=ffmpeg_bin, output_video=output_video, workdir=workdir)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -605,6 +969,25 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=DEFAULT_AZURE_SPEECH_STYLE,
         help="Azure Speech mstts:express-as style, e.g. professional / calm / cheerful",
     )
+    parser.add_argument(
+        "--resume-from-manifest",
+        help="Resume from an existing manifest JSON",
+    )
+    parser.add_argument(
+        "--segment-id",
+        type=int,
+        help="Restrict processing to one segment id",
+    )
+    parser.add_argument(
+        "--redo",
+        choices=["vision", "narration", "tts"],
+        help="Redo a specific stage for the selected segment",
+    )
+    parser.add_argument(
+        "--force-replan",
+        action="store_true",
+        help="Ignore existing manifest in workdir and rebuild segment plan",
+    )
     return parser
 
 
@@ -617,4 +1000,3 @@ def main(argv: List[str] | None = None) -> int:
 
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(main())
-

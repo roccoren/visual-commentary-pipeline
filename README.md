@@ -68,6 +68,25 @@ Or install the console script and run:
 visual-commentary   --input input.mp4   --output out/commentary_zh.mp4   --workdir out/work
 ```
 
+Resume or redo a single segment:
+
+```bash
+visual-commentary \
+  --input input.mp4 \
+  --output out/commentary_zh.mp4 \
+  --workdir out/work \
+  --resume-from-manifest out/work/commentary_manifest.json \
+  --segment-id 7 \
+  --redo narration
+```
+
+Redo semantics are explicit:
+- `--redo vision` → recompute frames/vision/narration/tts from that segment onward
+- `--redo narration` → reuse extracted frames, regenerate narration + tts
+- `--redo tts` → reuse existing narration, regenerate only speech timing/audio
+
+Accepted segments, narration rebuild, and final audio composition are all reconstructed from the manifest rather than transient in-memory lists.
+
 ## Timing control strategy
 
 The pipeline combines three layers of timing control:
@@ -81,9 +100,12 @@ If a clip is still slightly too long, ffmpeg `atempo` is used as a fallback only
 ## Project layout
 
 - `video_commentary/core.py` — reusable timing / SRT / SSML helpers
-- `video_commentary/pipeline.py` — Azure + ffmpeg end-to-end pipeline
+- `video_commentary/state.py` — segment state, manifest, and decision enums
+- `video_commentary/segment_policy.py` — basic skip / merge boundary policy
+- `video_commentary/duration_policy.py` — duration-fit decision policy
+- `video_commentary/pipeline.py` — Azure + ffmpeg orchestrator loop with resume/regenerate
 - `scripts/visual_commentary_pipeline.py` — runnable script entrypoint
-- `tests/test_video_commentary.py` — unit coverage for core helpers
+- `tests/test_video_commentary.py` — unit coverage for helpers + stateful workflow pieces
 
 ## Test
 

@@ -1,5 +1,6 @@
 """Tests for the video commentary engineering helpers."""
 
+import json
 from pathlib import Path
 
 from video_commentary.core import (
@@ -13,11 +14,22 @@ from video_commentary.core import (
     normalize_terms,
     sample_times,
 )
+from video_commentary.duration_policy import decide_duration_action
 from video_commentary.pipeline import (
+    accepted_narrations_from_manifest,
+    accepted_segments_from_manifest,
     azure_openai_uses_responses_api,
     build_azure_openai_vision_request,
     extract_azure_openai_text,
+    get_previous_accepted_narration,
+    get_previous_segment,
+    note_segment_decision,
+    reset_segment_for_redo,
+    segment_state_to_narration,
+    should_process_segment,
 )
+from video_commentary.segment_policy import decide_segment_action
+from video_commentary.state import Decision, Manifest, RetryEntry, SegmentState, SegmentStatus
 
 
 class TestBuildSegments:
@@ -108,10 +120,10 @@ class TestAzureSsml:
             style="professional",
         )
 
-        assert "mstts:audioduration value=\"18000ms\"" in ssml
-        assert "<prosody rate=\"+5%\">AT&amp;T &lt;Azure&gt;</prosody>" in ssml
+        assert 'mstts:audioduration value="18000ms"' in ssml
+        assert '<prosody rate="+5%">AT&amp;T &lt;Azure&gt;</prosody>' in ssml
         assert 'style="professional"' in ssml
-        assert "xmlns:mstts=\"https://www.w3.org/2001/mstts\"" in ssml
+        assert 'xmlns:mstts="https://www.w3.org/2001/mstts"' in ssml
 
     def test_omits_optional_nodes_when_not_requested(self):
         ssml = build_azure_tts_ssml(
@@ -121,7 +133,7 @@ class TestAzureSsml:
 
         assert "mstts:audioduration" not in ssml
         assert "mstts:express-as" not in ssml
-        assert "<prosody rate=\"+0%\">讲解内容</prosody>" in ssml
+        assert '<prosody rate="+0%">讲解内容</prosody>' in ssml
 
 
 class TestAzureOpenAIRequestRouting:
@@ -198,3 +210,211 @@ class TestAzureOpenAIResponseParsing:
 
         assert extract_azure_openai_text(body, "chat_completions") == '{"narration_zh": "这里继续演示配置过程。"}'
 
+
+class TestStateModels:
+    def test_manifest_round_trip(self, tmp_path: Path):
+        manifest = Manifest(
+            version="2.0",
+            input_video="in.mp4",
+            output_video="out.mp4",
+            workdir=str(tmp_path),
+            scene_threshold=0.32,
+            min_segment=3.0,
+            max_segment=12.0,
+            segment_buffer=0.35,
+            base_rate="+0%",
+            azure_style="professional",
+            duration=20.0,
+            segments=[
+                SegmentState(
+                    id=1,
+                    start=0.0,
+                    end=5.0,
+                    duration=5.0,
+                    status=SegmentStatus.ACCEPTED,
+                    selected_draft="第一页介绍。",
+                    decision=Decision.ACCEPT,
+                    retry_history=[RetryEntry(action=Decision.ACCEPT, reason="ok")],
+                )
+            ],
+        )
+
+        path = tmp_path / "manifest.json"
+        manifest.save(path)
+        loaded = Manifest.load(path)
+
+        assert loaded.version == "2.0"
+        assert loaded.segments[0].status == SegmentStatus.ACCEPTED
+        assert loaded.segments[0].decision == Decision.ACCEPT
+        assert loaded.segments[0].retry_history[0].action == Decision.ACCEPT
+
+    def test_segment_state_to_narration(self):
+        segment = SegmentState(
+            id=3,
+            start=10.0,
+            end=13.0,
+            duration=3.0,
+            title="标题",
+            visible_points=["a"],
+            on_screen_text=["b"],
+            selected_draft="这里展示了关键步骤。",
+            frame_paths=["f1.jpg"],
+            raw_audio_path="raw.mp3",
+            raw_audio_duration=2.8,
+            fitted_audio_path="fit.mp3",
+            fitted_audio_duration=2.7,
+        )
+
+        narration = segment_state_to_narration(segment)
+        assert narration.narration_zh == "这里展示了关键步骤。"
+        assert narration.fitted_audio_path == "fit.mp3"
+
+    def test_manifest_helpers_use_manifest_as_single_source_of_truth(self):
+        accepted = SegmentState(
+            id=1,
+            start=0.0,
+            end=5.0,
+            duration=5.0,
+            status=SegmentStatus.ACCEPTED,
+            title="第一页",
+            selected_draft="第一页介绍。",
+            fitted_audio_path="fit1.mp3",
+            raw_audio_path="raw1.mp3",
+        )
+        pending = SegmentState(
+            id=2,
+            start=5.0,
+            end=9.0,
+            duration=4.0,
+            status=SegmentStatus.CONTENT_GENERATED,
+            selected_draft="第二页草稿。",
+            fitted_audio_path="",
+        )
+        manifest = Manifest(
+            version="2.0",
+            input_video="in.mp4",
+            output_video="out.mp4",
+            workdir="/tmp/work",
+            scene_threshold=0.32,
+            min_segment=3.0,
+            max_segment=12.0,
+            segment_buffer=0.35,
+            base_rate="+0%",
+            azure_style="professional",
+            duration=20.0,
+            segments=[accepted, pending],
+        )
+
+        accepted_segments = accepted_segments_from_manifest(manifest)
+        accepted_narrations = accepted_narrations_from_manifest(manifest)
+
+        assert [segment.id for segment in accepted_segments] == [1]
+        assert [item.id for item in accepted_narrations] == [1]
+        assert accepted_narrations[0].narration_zh == "第一页介绍。"
+
+    def test_previous_segment_helpers_are_manifest_based(self):
+        manifest = Manifest(
+            version="2.0",
+            input_video="in.mp4",
+            output_video="out.mp4",
+            workdir="/tmp/work",
+            scene_threshold=0.32,
+            min_segment=3.0,
+            max_segment=12.0,
+            segment_buffer=0.35,
+            base_rate="+0%",
+            azure_style="professional",
+            duration=20.0,
+            segments=[
+                SegmentState(id=1, start=0.0, end=3.0, duration=3.0, status=SegmentStatus.ACCEPTED, selected_draft="A"),
+                SegmentState(id=2, start=3.0, end=6.0, duration=3.0, status=SegmentStatus.PENDING, selected_draft=""),
+                SegmentState(id=3, start=6.0, end=9.0, duration=3.0, status=SegmentStatus.ACCEPTED, selected_draft="C"),
+            ],
+        )
+
+        previous = get_previous_segment(manifest, 3)
+        previous_text = get_previous_accepted_narration(manifest, 3)
+
+        assert previous is not None and previous.id == 2
+        assert previous_text == "A"
+
+
+class TestDecisionHelpers:
+    def test_note_segment_decision_updates_reason_and_history(self):
+        segment = SegmentState(id=1, start=0.0, end=2.0, duration=2.0)
+        note_segment_decision(segment, decision=Decision.RETRY_TTS, reason="need better timing", details={"gap_ms": 420})
+
+        assert segment.decision == Decision.RETRY_TTS
+        assert segment.decision_reason == "need better timing"
+        assert segment.retry_history[-1].action == Decision.RETRY_TTS
+        assert segment.retry_history[-1].details == {"gap_ms": 420}
+
+
+class TestPolicies:
+    def test_duration_policy_accepts_small_gap(self):
+        result = decide_duration_action(budget_seconds=10.0, fitted_duration_seconds=10.2)
+        assert result.decision == Decision.ACCEPT
+
+    def test_duration_policy_requests_tts_retry_for_medium_gap(self):
+        result = decide_duration_action(budget_seconds=10.0, fitted_duration_seconds=10.8)
+        assert result.decision == Decision.RETRY_TTS
+
+    def test_duration_policy_requests_narration_retry_for_large_gap(self):
+        result = decide_duration_action(budget_seconds=10.0, fitted_duration_seconds=11.5)
+        assert result.decision == Decision.RETRY_NARRATION
+
+    def test_segment_policy_skips_tiny_segment(self):
+        segment = SegmentState(id=1, start=0.0, end=0.6, duration=0.6)
+        result = decide_segment_action(segment)
+        assert result.decision == Decision.SKIP_SEGMENT
+
+    def test_segment_policy_merges_very_short_segment_with_previous(self):
+        previous = SegmentState(id=1, start=0.0, end=5.0, duration=5.0)
+        segment = SegmentState(id=2, start=5.0, end=6.2, duration=1.2)
+        result = decide_segment_action(segment, previous_segment=previous)
+        assert result.decision == Decision.MERGE_WITH_PREVIOUS
+
+
+class TestResumeRedoHelpers:
+    def test_should_process_segment_defaults_to_unfinished_only(self):
+        accepted = SegmentState(id=1, start=0.0, end=1.0, duration=1.0, status=SegmentStatus.ACCEPTED)
+        pending = SegmentState(id=2, start=1.0, end=2.0, duration=1.0, status=SegmentStatus.PENDING)
+
+        assert should_process_segment(accepted, redo=None, target_segment_id=None) is False
+        assert should_process_segment(pending, redo=None, target_segment_id=None) is True
+
+    def test_should_process_segment_honors_target_and_redo(self):
+        accepted = SegmentState(id=7, start=0.0, end=1.0, duration=1.0, status=SegmentStatus.ACCEPTED)
+        assert should_process_segment(accepted, redo="tts", target_segment_id=7) is True
+        assert should_process_segment(accepted, redo="tts", target_segment_id=8) is False
+
+    def test_reset_segment_for_redo(self):
+        segment = SegmentState(
+            id=5,
+            start=0.0,
+            end=3.0,
+            duration=3.0,
+            status=SegmentStatus.ACCEPTED,
+            title="标题",
+            selected_draft="讲稿",
+            raw_audio_path="raw.mp3",
+            fitted_audio_path="fit.mp3",
+            decision=Decision.ACCEPT,
+            decision_reason="ok",
+            errors=["x"],
+        )
+
+        reset_segment_for_redo(segment, "tts")
+        assert segment.status == SegmentStatus.CONTENT_GENERATED
+        assert segment.raw_audio_path == ""
+        assert segment.fitted_audio_path == ""
+        assert segment.decision is None
+        assert segment.errors == []
+
+        reset_segment_for_redo(segment, "narration")
+        assert segment.status == SegmentStatus.FRAMES_EXTRACTED
+        assert segment.selected_draft == ""
+
+        reset_segment_for_redo(segment, "vision")
+        assert segment.status == SegmentStatus.PENDING
+        assert segment.frame_paths == []
