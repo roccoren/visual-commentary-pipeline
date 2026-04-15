@@ -14,6 +14,8 @@ from .core import (
     serialize_manifest,
     write_srt_file,
 )
+from .graph import build_pipeline_graph, build_segment_graph, narrate_video_graph
+from .graph_state import PipelineState, SegmentProcessingState
 from .planner import VideoProfile, normalize_video_profile, plan_video_profile
 from .qa_gate import QAGateResult, evaluate_narration_quality
 from .state import Decision, Manifest, SegmentState, SegmentStatus
@@ -22,7 +24,9 @@ __all__ = [
     "DEFAULT_TERM_MAP",
     "Decision",
     "Manifest",
+    "PipelineState",
     "QAGateResult",
+    "SegmentProcessingState",
     "VideoProfile",
     "Segment",
     "SegmentNarration",
@@ -30,10 +34,13 @@ __all__ = [
     "SegmentStatus",
     "atempo_chain",
     "build_azure_tts_ssml",
+    "build_pipeline_graph",
+    "build_segment_graph",
     "build_segments",
     "build_srt_text",
     "evaluate_narration_quality",
     "format_srt_timestamp",
+    "narrate_video_graph",
     "normalize_terms",
     "normalize_video_profile",
     "plan_video_profile",

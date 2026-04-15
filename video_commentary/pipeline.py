@@ -1318,13 +1318,23 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Ignore existing manifest in workdir and rebuild segment plan",
     )
+    parser.add_argument(
+        "--graph",
+        action="store_true",
+        help="Use LangGraph StateGraph orchestration instead of the imperative loop",
+    )
     return parser
 
 
 def main(argv: List[str] | None = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
-    print(json.dumps(narrate_video(args), ensure_ascii=False, indent=2))
+    if args.graph:
+        from .graph import narrate_video_graph
+
+        print(json.dumps(narrate_video_graph(args), ensure_ascii=False, indent=2))
+    else:
+        print(json.dumps(narrate_video(args), ensure_ascii=False, indent=2))
     return 0
 
 
