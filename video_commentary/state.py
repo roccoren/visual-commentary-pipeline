@@ -190,6 +190,7 @@ class Manifest:
     base_rate: str
     azure_style: str
     duration: float
+    target_cps: float = 4.5
     video_profile: VideoProfile | None = None
     narrative_outline: str = ""
     status: str = "initialized"
@@ -209,6 +210,7 @@ class Manifest:
             "base_rate": self.base_rate,
             "azure_style": self.azure_style,
             "duration": self.duration,
+            "target_cps": self.target_cps,
             "video_profile": self.video_profile.to_dict() if self.video_profile else None,
             "narrative_outline": self.narrative_outline,
             "status": self.status,
@@ -230,6 +232,7 @@ class Manifest:
             base_rate=str(data["base_rate"]),
             azure_style=str(data["azure_style"]),
             duration=float(data["duration"]),
+            target_cps=float(data.get("target_cps", 4.5)),
             video_profile=VideoProfile.from_dict(data["video_profile"]) if data.get("video_profile") else None,
             narrative_outline=str(data.get("narrative_outline", "")),
             status=str(data.get("status", "initialized")),

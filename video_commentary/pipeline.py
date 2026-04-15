@@ -496,7 +496,7 @@ def polish_narrations_for_coherence(manifest: Manifest) -> int:
     return revised_count
 
 
-def call_azure_openai_vision(*, frame_paths: List[Path], segment: SegmentState, previous_narration: str, style_policy: dict[str, str] | None = None, narrative_outline: str = "", context_window: str = "") -> dict:
+def call_azure_openai_vision(*, frame_paths: List[Path], segment: SegmentState, previous_narration: str, style_policy: dict[str, str] | None = None, narrative_outline: str = "", context_window: str = "", target_cps: float = 4.5) -> dict:
     endpoint = env_required("AZURE_OPENAI_ENDPOINT").rstrip("/")
     api_key = os.getenv("AZURE_OPENAI_API_KEY")
     deployment = env_required("AZURE_OPENAI_DEPLOYMENT")
@@ -505,6 +505,7 @@ def call_azure_openai_vision(*, frame_paths: List[Path], segment: SegmentState, 
     style_policy = style_policy or {}
     narration_density = style_policy.get("narration_density", "balanced")
     narration_focus = style_policy.get("narration_focus", "screen_change")
+    target_chars = max(12, int(segment.duration * target_cps))
     max_chars = max(18, min(90, int(segment.duration * 8)))
 
     outline_block = ""
@@ -528,11 +529,11 @@ def call_azure_openai_vision(*, frame_paths: List[Path], segment: SegmentState, 
         1. 不要逐字朗读所有屏幕文字。
         2. 优先讲当前画面在展示什么、焦点是什么、和上一段相比新增了什么。
         3. 口吻要像自然中文口播，不要像 OCR 或图像描述。
-        4. 讲解必须能在大约 {segment.duration:.1f} 秒内说完，尽量控制在 {max_chars} 个中文字符以内。
-        5. 如画面信息很少，就简短说明“这里继续展示/演示……”。
+        4. 讲解目标字数约 {target_chars} 个中文字符（语速约 {target_cps} 字/秒 × {segment.duration:.1f} 秒），严格控制在 {max_chars} 字以内。
+        5. 如画面信息很少，就简短说明”这里继续展示/演示……”。
         6. 专名保持英文，例如 Azure AI Foundry、OpenAI、Mistral、Cohere、DeepSeek、GitHub、Copilot Studio。
         7. 当前 narration_density={narration_density}，narration_focus={narration_focus}。
-        8. 请确保本段讲解与前后段落自然衍接，避免生硬的过渡词（如“上一页”“下一页”），用自然口语过渡。
+        8. 请确保本段讲解与前后段落自然衍接，避免生硬的过渡词（如”上一页””下一页”），用自然口语过渡。
 {outline_block}{context_block}
         时间窗：{segment.start:.3f}s - {segment.end:.3f}s
         上一段讲解：{previous_narration or '无'}
@@ -1125,48 +1126,6 @@ def rewrite_narration_once(
     return rewritten
 
 
-def _try_llm_shorten(
-    segment: SegmentState,
-    previous_narration: str,
-) -> bool:
-    """Attempt LLM-based shortening.  Returns True if QA now passes."""
-    from .llm_critic import shorten_narration_llm
-
-    shorten_result = shorten_narration_llm(
-        narration=segment.selected_draft,
-        segment=segment,
-        previous_narration=previous_narration,
-    )
-    if shorten_result.confidence == 0.0:
-        return False
-
-    segment.rewritten_draft = shorten_result.narration_zh
-    segment.selected_draft = shorten_result.narration_zh
-    segment.draft_candidates.append(shorten_result.narration_zh)
-    segment.rewrite_attempt_count += 1
-
-    post_qa = evaluate_narration_quality(
-        narration=segment.selected_draft,
-        previous_narration=previous_narration,
-        duration_seconds=segment.duration,
-    )
-    segment.critic_feedback = post_qa.feedback
-    note_segment_decision(
-        segment,
-        decision=post_qa.decision,
-        reason=f"post-llm-shorten: {post_qa.reason}",
-        details={"phase": "post-llm-shorten", "changes": shorten_result.changes_made, **post_qa.details},
-    )
-    if post_qa.passed:
-        segment.decision = Decision.ACCEPT
-        segment.final_decision = Decision.ACCEPT
-        segment.decision_reason = post_qa.reason
-        segment.status = SegmentStatus.CONTENT_GENERATED
-        segment.human_review_status = ""
-        return True
-    return False
-
-
 def run_qa_gate_step(manifest: Manifest, segment: SegmentState) -> None:
     previous_narration = get_previous_accepted_narration(manifest, segment.id)
     qa_result = evaluate_narration_quality(
@@ -1220,19 +1179,11 @@ def run_qa_gate_step(manifest: Manifest, segment: SegmentState) -> None:
             segment.human_review_status = ""
             return
 
-        # Rule-based rewrite failed — try LLM shortening before human review
-        if _try_llm_shorten(segment, previous_narration):
-            return
-
         segment.decision = Decision.NEEDS_HUMAN_REVIEW
         segment.final_decision = Decision.NEEDS_HUMAN_REVIEW
         segment.decision_reason = second_qa.reason
         segment.status = SegmentStatus.NEEDS_HUMAN_REVIEW
         segment.human_review_status = "qa-rewrite-failed"
-        return
-
-    # Hard QA failure or exhausted retries — try LLM shortening before human review
-    if _try_llm_shorten(segment, previous_narration):
         return
 
     segment.final_decision = qa_result.decision
@@ -1713,6 +1664,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--force-replan",
         action="store_true",
         help="Ignore existing manifest in workdir and rebuild segment plan",
+    )
+    parser.add_argument(
+        "--target-cps",
+        type=float,
+        default=4.5,
+        help="Target characters-per-second for uniform speech rate across segments (default: 4.5)",
     )
     parser.add_argument(
         "--skip-coherence",

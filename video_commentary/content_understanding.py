@@ -179,11 +179,15 @@ def analyze_video(
         "Content-Type": "application/octet-stream",
     }
 
-    # Submit the video for analysis
-    url = f"{endpoint}/contentunderstanding/analyzers/{analyzer}:analyze?api-version={api_version}"
+    # Submit the video for analysis (binary upload via analyzeBinary endpoint)
+    url = f"{endpoint}/contentunderstanding/analyzers/{analyzer}:analyzeBinary?api-version={api_version}"
     with open(video_path, "rb") as f:
         response = requests.post(url, headers=headers, data=f, timeout=120)
-    response.raise_for_status()
+    if not response.ok:
+        detail = response.text[:1000] if response.text else "(no body)"
+        raise RuntimeError(
+            f"Content Understanding request failed ({response.status_code}): {detail}"
+        )
 
     # Get the operation location for polling
     operation_url = response.headers.get("Operation-Location", "")
