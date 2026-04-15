@@ -109,6 +109,26 @@ REWRITER_SYSTEM_PROMPT = textwrap.dedent("""\
     }
 """)
 
+SHORTENER_SYSTEM_PROMPT = textwrap.dedent("""\
+    你是一位专业的视频讲解文案编辑。你的任务是将过长的旁白精简到指定字数以内，
+    同时保留最重要的信息。
+
+    规则：
+    1. 严格遵守字数上限，改写后的文案必须不超过指定字数。
+    2. 保持中文口播风格，不要像 OCR 或图像描述。
+    3. 保留英文专名不翻译（Azure、OpenAI、Copilot Studio 等）。
+    4. 优先保留操作步骤和关键信息，删减修饰性描述。
+    5. 如果画面信息很少，简短说明即可。
+    6. 不要与上一段旁白重复。
+
+    你必须返回有效 JSON：
+    {
+      "narration_zh": "精简后的中文旁白",
+      "changes_made": ["改了什么1", "改了什么2"],
+      "confidence": 0.0-1.0
+    }
+""")
+
 
 # ---------------------------------------------------------------------------
 # LLM interaction (uses langchain-core / Azure OpenAI)
@@ -326,6 +346,73 @@ def rewrite_narration_llm(
         return RewriteResult(
             narration_zh=narration,
             changes_made=["LLM rewriter unavailable, returning original"],
+            confidence=0.0,
+        )
+
+
+def shorten_narration_llm(
+    *,
+    narration: str,
+    segment: SegmentState,
+    previous_narration: str,
+    qa_config: QAConfig | None = None,
+) -> RewriteResult:
+    """Aggressively shorten narration to fit the segment's character budget.
+
+    Called as a last resort before marking a segment as NEEDS_HUMAN_REVIEW
+    due to density/length issues.  Uses a dedicated shortening prompt that
+    prioritises brevity over preserving all information.
+
+    Parameters
+    ----------
+    narration:
+        The narration text that is too long.
+    segment:
+        The segment being narrated (provides duration and visual context).
+    previous_narration:
+        The accepted narration from the previous segment.
+    qa_config:
+        Optional QA thresholds (uses defaults when *None*).
+
+    Returns
+    -------
+    RewriteResult
+        The shortened narration.  ``confidence == 0.0`` signals LLM was
+        unavailable and the original narration is returned unchanged.
+    """
+    cfg = qa_config or QAConfig()
+    max_chars = cfg.max_chars(segment.duration)
+
+    user_prompt = textwrap.dedent(f"""\
+        请将以下过长的视频旁白精简到 {max_chars} 字以内。
+
+        ## 片段信息
+        - 时间窗：{segment.start:.3f}s - {segment.end:.3f}s（时长 {segment.duration:.1f}s）
+        - 字数上限：{max_chars} 字（当前 {len(narration.strip())} 字）
+
+        ## 画面关键信息
+        - 可见要素：{json.dumps(segment.visible_points, ensure_ascii=False)}
+        - 屏幕文字：{json.dumps(segment.on_screen_text, ensure_ascii=False)}
+
+        ## 上一段旁白（避免重复）
+        {previous_narration or '（无）'}
+
+        ## 当前旁白（需精简）
+        {narration}
+    """)
+
+    try:
+        raw = _call_llm_json(system_prompt=SHORTENER_SYSTEM_PROMPT, user_prompt=user_prompt)
+        shortened = normalize_terms(str(raw.get("narration_zh", narration)))
+        return RewriteResult(
+            narration_zh=shortened,
+            changes_made=[str(c) for c in raw.get("changes_made", [])],
+            confidence=float(raw.get("confidence", 0.5)),
+        )
+    except Exception:
+        return RewriteResult(
+            narration_zh=narration,
+            changes_made=["LLM shortener unavailable, returning original"],
             confidence=0.0,
         )
 

@@ -1125,6 +1125,48 @@ def rewrite_narration_once(
     return rewritten
 
 
+def _try_llm_shorten(
+    segment: SegmentState,
+    previous_narration: str,
+) -> bool:
+    """Attempt LLM-based shortening.  Returns True if QA now passes."""
+    from .llm_critic import shorten_narration_llm
+
+    shorten_result = shorten_narration_llm(
+        narration=segment.selected_draft,
+        segment=segment,
+        previous_narration=previous_narration,
+    )
+    if shorten_result.confidence == 0.0:
+        return False
+
+    segment.rewritten_draft = shorten_result.narration_zh
+    segment.selected_draft = shorten_result.narration_zh
+    segment.draft_candidates.append(shorten_result.narration_zh)
+    segment.rewrite_attempt_count += 1
+
+    post_qa = evaluate_narration_quality(
+        narration=segment.selected_draft,
+        previous_narration=previous_narration,
+        duration_seconds=segment.duration,
+    )
+    segment.critic_feedback = post_qa.feedback
+    note_segment_decision(
+        segment,
+        decision=post_qa.decision,
+        reason=f"post-llm-shorten: {post_qa.reason}",
+        details={"phase": "post-llm-shorten", "changes": shorten_result.changes_made, **post_qa.details},
+    )
+    if post_qa.passed:
+        segment.decision = Decision.ACCEPT
+        segment.final_decision = Decision.ACCEPT
+        segment.decision_reason = post_qa.reason
+        segment.status = SegmentStatus.CONTENT_GENERATED
+        segment.human_review_status = ""
+        return True
+    return False
+
+
 def run_qa_gate_step(manifest: Manifest, segment: SegmentState) -> None:
     previous_narration = get_previous_accepted_narration(manifest, segment.id)
     qa_result = evaluate_narration_quality(
@@ -1178,11 +1220,19 @@ def run_qa_gate_step(manifest: Manifest, segment: SegmentState) -> None:
             segment.human_review_status = ""
             return
 
+        # Rule-based rewrite failed — try LLM shortening before human review
+        if _try_llm_shorten(segment, previous_narration):
+            return
+
         segment.decision = Decision.NEEDS_HUMAN_REVIEW
         segment.final_decision = Decision.NEEDS_HUMAN_REVIEW
         segment.decision_reason = second_qa.reason
         segment.status = SegmentStatus.NEEDS_HUMAN_REVIEW
         segment.human_review_status = "qa-rewrite-failed"
+        return
+
+    # Hard QA failure or exhausted retries — try LLM shortening before human review
+    if _try_llm_shorten(segment, previous_narration):
         return
 
     segment.final_decision = qa_result.decision

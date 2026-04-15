@@ -260,7 +260,43 @@ def qa_gate_step(state: SegmentProcessingState) -> dict[str, Any]:
                     "segment_status": segment.status.value,
                 }
 
-    # Exhausted retries or high-severity issue
+    # Exhausted retries or high-severity issue — try LLM shortening as last resort
+    from .llm_critic import shorten_narration_llm
+
+    shorten_result = shorten_narration_llm(
+        narration=segment.selected_draft,
+        segment=segment,
+        previous_narration=previous_narration,
+        qa_config=qa_config,
+    )
+    if shorten_result.confidence > 0.0:
+        segment.rewritten_draft = shorten_result.narration_zh
+        segment.selected_draft = shorten_result.narration_zh
+        segment.draft_candidates.append(shorten_result.narration_zh)
+        segment.rewrite_attempt_count += 1
+
+        passed3, decision3, reason3, feedback3, _ = evaluate_narration_two_layer(
+            narration=segment.selected_draft,
+            segment=segment,
+            previous_narration=previous_narration,
+            use_llm=use_llm,
+            qa_config=qa_config,
+        )
+        segment.critic_feedback = feedback3
+        note_segment_decision(
+            segment, decision=decision3,
+            reason=f"post-llm-shorten: {reason3}",
+            details={"phase": "post-llm-shorten", "changes": shorten_result.changes_made},
+        )
+        if passed3:
+            segment.final_decision = Decision.ACCEPT
+            return {
+                **_save_manifest(state, manifest),
+                "qa_passed": True,
+                "narration_retry_count": retry_count + 1,
+                "segment_status": segment.status.value,
+            }
+
     segment.final_decision = decision
     segment.status = SegmentStatus.NEEDS_HUMAN_REVIEW
     segment.human_review_status = "llm-qa-failed"
