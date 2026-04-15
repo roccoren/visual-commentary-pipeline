@@ -569,6 +569,7 @@ def clear_segment_outputs(segment: SegmentState) -> None:
     segment.fitted_audio_duration = 0.0
     segment.duration_gap_ms = 0
     segment.decision = None
+    segment.final_decision = None
     segment.decision_reason = ""
     segment.errors = []
     segment.human_review_status = ""
@@ -594,6 +595,10 @@ def reset_segment_for_redo(segment: SegmentState, redo: str) -> None:
         segment.vision_result = {}
         segment.draft_candidates = []
         segment.selected_draft = ""
+        segment.original_draft = ""
+        segment.rewritten_draft = ""
+        segment.rewrite_attempt_count = 0
+        segment.auto_retry_attempted = False
         segment.critic_feedback = []
         clear_segment_outputs(segment)
     elif redo == "tts":
@@ -672,17 +677,49 @@ def run_narration_step(segment: SegmentState) -> None:
     narration = normalize_terms(str(segment.vision_result.get("narration_zh", "这里展示了当前画面的核心内容。")))
     segment.draft_candidates = [narration]
     segment.selected_draft = narration
+    segment.original_draft = narration
     segment.status = SegmentStatus.CONTENT_GENERATED
 
 
+def rewrite_narration_once(
+    *,
+    narration: str,
+    critic_feedback: list[str],
+    decision_reason: str,
+    duration_seconds: float,
+    previous_narration: str,
+) -> str:
+    rewritten = narration.strip()
+    if "empty narration" in critic_feedback or not rewritten:
+        rewritten = "这里继续展示当前步骤的关键内容。"
+    elif "repetitive narration" in critic_feedback:
+        previous_clean = previous_narration.strip()
+        if previous_clean and rewritten == previous_clean:
+            rewritten = "这里进一步展示了与上一段不同的当前操作细节。"
+        else:
+            rewritten = f"这里进一步说明当前画面的新增内容：{rewritten}".strip()
+    elif "too long or too dense narration" in critic_feedback:
+        max_chars = max(18, min(90, int(duration_seconds * 8)))
+        rewritten = rewritten[:max_chars].rstrip("，、；： ")
+        if not rewritten:
+            rewritten = "这里继续展示当前步骤。"
+
+    rewritten = normalize_terms(rewritten)
+    if previous_narration and rewritten.strip() == previous_narration.strip():
+        rewritten = normalize_terms("这里继续展示当前步骤的新增内容。")
+    return rewritten
+
+
 def run_qa_gate_step(manifest: Manifest, segment: SegmentState) -> None:
+    previous_narration = get_previous_accepted_narration(manifest, segment.id)
     qa_result = evaluate_narration_quality(
         narration=segment.selected_draft,
-        previous_narration=get_previous_accepted_narration(manifest, segment.id),
+        previous_narration=previous_narration,
         duration_seconds=segment.duration,
     )
     segment.critic_feedback = qa_result.feedback
     if qa_result.passed:
+        segment.final_decision = Decision.ACCEPT
         return
 
     note_segment_decision(
@@ -691,6 +728,49 @@ def run_qa_gate_step(manifest: Manifest, segment: SegmentState) -> None:
         reason=qa_result.reason,
         details=qa_result.details,
     )
+
+    if qa_result.decision == Decision.RETRY_NARRATION and not segment.auto_retry_attempted and segment.rewrite_attempt_count < 1:
+        rewritten = rewrite_narration_once(
+            narration=segment.selected_draft,
+            critic_feedback=segment.critic_feedback,
+            decision_reason=qa_result.reason,
+            duration_seconds=segment.duration,
+            previous_narration=previous_narration,
+        )
+        segment.rewritten_draft = rewritten
+        segment.selected_draft = rewritten
+        segment.draft_candidates.append(rewritten)
+        segment.rewrite_attempt_count += 1
+        segment.auto_retry_attempted = True
+
+        second_qa = evaluate_narration_quality(
+            narration=segment.selected_draft,
+            previous_narration=previous_narration,
+            duration_seconds=segment.duration,
+        )
+        segment.critic_feedback = second_qa.feedback
+        note_segment_decision(
+            segment,
+            decision=second_qa.decision,
+            reason=f"post-rewrite qa: {second_qa.reason}",
+            details={"phase": "post-rewrite", **second_qa.details},
+        )
+        if second_qa.passed:
+            segment.decision = Decision.ACCEPT
+            segment.final_decision = Decision.ACCEPT
+            segment.decision_reason = second_qa.reason
+            segment.status = SegmentStatus.CONTENT_GENERATED
+            segment.human_review_status = ""
+            return
+
+        segment.decision = Decision.NEEDS_HUMAN_REVIEW
+        segment.final_decision = Decision.NEEDS_HUMAN_REVIEW
+        segment.decision_reason = second_qa.reason
+        segment.status = SegmentStatus.NEEDS_HUMAN_REVIEW
+        segment.human_review_status = "qa-rewrite-failed"
+        return
+
+    segment.final_decision = qa_result.decision
     if qa_result.decision == Decision.RETRY_NARRATION:
         segment.status = SegmentStatus.NEEDS_HUMAN_REVIEW
         segment.human_review_status = "qa-retry-narration"

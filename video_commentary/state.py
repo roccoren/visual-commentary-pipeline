@@ -51,6 +51,10 @@ class SegmentState:
     vision_result: dict[str, Any] = field(default_factory=dict)
     draft_candidates: list[str] = field(default_factory=list)
     selected_draft: str = ""
+    original_draft: str = ""
+    rewritten_draft: str = ""
+    rewrite_attempt_count: int = 0
+    auto_retry_attempted: bool = False
     critic_feedback: list[str] = field(default_factory=list)
     raw_audio_path: str = ""
     raw_audio_duration: float = 0.0
@@ -59,6 +63,7 @@ class SegmentState:
     duration_budget: float = 0.0
     duration_gap_ms: int = 0
     decision: Decision | None = None
+    final_decision: Decision | None = None
     decision_reason: str = ""
     retry_history: list[RetryEntry] = field(default_factory=list)
     human_review_status: str = ""
@@ -72,6 +77,7 @@ class SegmentState:
         data = asdict(self)
         data["status"] = self.status.value
         data["decision"] = self.decision.value if self.decision else None
+        data["final_decision"] = self.final_decision.value if self.final_decision else None
         data["retry_history"] = [
             {
                 "action": item.action.value,
@@ -93,6 +99,7 @@ class SegmentState:
             for item in data.get("retry_history", [])
         ]
         decision = data.get("decision")
+        final_decision = data.get("final_decision")
         return cls(
             id=int(data["id"]),
             start=float(data["start"]),
@@ -106,6 +113,10 @@ class SegmentState:
             vision_result=dict(data.get("vision_result", {})),
             draft_candidates=list(data.get("draft_candidates", [])),
             selected_draft=str(data.get("selected_draft", "")),
+            original_draft=str(data.get("original_draft", "")),
+            rewritten_draft=str(data.get("rewritten_draft", "")),
+            rewrite_attempt_count=int(data.get("rewrite_attempt_count", 0)),
+            auto_retry_attempted=bool(data.get("auto_retry_attempted", False)),
             critic_feedback=list(data.get("critic_feedback", [])),
             raw_audio_path=str(data.get("raw_audio_path", "")),
             raw_audio_duration=float(data.get("raw_audio_duration", 0.0)),
@@ -114,6 +125,7 @@ class SegmentState:
             duration_budget=float(data.get("duration_budget", 0.0)),
             duration_gap_ms=int(data.get("duration_gap_ms", 0)),
             decision=Decision(decision) if decision else None,
+            final_decision=Decision(final_decision) if final_decision else None,
             decision_reason=str(data.get("decision_reason", "")),
             retry_history=retry_history,
             human_review_status=str(data.get("human_review_status", "")),

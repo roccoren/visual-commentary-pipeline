@@ -25,6 +25,7 @@ from video_commentary.pipeline import (
     get_previous_segment,
     note_segment_decision,
     reset_segment_for_redo,
+    rewrite_narration_once,
     run_qa_gate_step,
     segment_state_to_narration,
     should_process_segment,
@@ -385,7 +386,46 @@ class TestQAGate:
         assert review_result.passed is False
         assert review_result.decision == Decision.NEEDS_HUMAN_REVIEW
 
-    def test_run_qa_gate_step_records_feedback_on_segment(self):
+    def test_rewrite_narration_once_fixes_empty_text(self):
+        rewritten = rewrite_narration_once(
+            narration="   ",
+            critic_feedback=["empty narration"],
+            decision_reason="narration is empty after normalization",
+            duration_seconds=4.0,
+            previous_narration="上一段",
+        )
+        assert rewritten
+        assert rewritten != "上一段"
+
+    def test_run_qa_gate_step_rewrites_empty_once_and_passes(self):
+        manifest = Manifest(
+            version="2.0",
+            input_video="in.mp4",
+            output_video="out.mp4",
+            workdir="/tmp/work",
+            scene_threshold=0.32,
+            min_segment=3.0,
+            max_segment=12.0,
+            segment_buffer=0.35,
+            base_rate="+0%",
+            azure_style="professional",
+            duration=20.0,
+            segments=[
+                SegmentState(id=1, start=0.0, end=4.0, duration=4.0, status=SegmentStatus.CONTENT_GENERATED, selected_draft="   "),
+            ],
+        )
+        segment = manifest.segments[0]
+
+        run_qa_gate_step(manifest, segment)
+
+        assert segment.status == SegmentStatus.CONTENT_GENERATED
+        assert segment.auto_retry_attempted is True
+        assert segment.rewrite_attempt_count == 1
+        assert segment.original_draft == ""
+        assert segment.rewritten_draft
+        assert segment.final_decision == Decision.ACCEPT
+
+    def test_run_qa_gate_step_rewrites_repetitive_once_and_passes(self):
         manifest = Manifest(
             version="2.0",
             input_video="in.mp4",
@@ -400,17 +440,92 @@ class TestQAGate:
             duration=20.0,
             segments=[
                 SegmentState(id=1, start=0.0, end=4.0, duration=4.0, status=SegmentStatus.ACCEPTED, selected_draft="上一段"),
-                SegmentState(id=2, start=4.0, end=8.0, duration=4.0, status=SegmentStatus.CONTENT_GENERATED, selected_draft="上一段"),
+                SegmentState(id=2, start=4.0, end=8.0, duration=4.0, status=SegmentStatus.CONTENT_GENERATED, selected_draft="上一段", original_draft="上一段"),
             ],
         )
         segment = manifest.segments[1]
 
         run_qa_gate_step(manifest, segment)
 
+        assert segment.status == SegmentStatus.CONTENT_GENERATED
+        assert segment.auto_retry_attempted is True
+        assert segment.rewrite_attempt_count == 1
+        assert segment.rewritten_draft
+        assert segment.rewritten_draft != "上一段"
+        assert segment.final_decision == Decision.ACCEPT
+
+    def test_run_qa_gate_step_too_dense_after_rewrite_needs_review(self):
+        original = "一二三四五六七八九十一二三四五六七八九十"
+        manifest = Manifest(
+            version="2.0",
+            input_video="in.mp4",
+            output_video="out.mp4",
+            workdir="/tmp/work",
+            scene_threshold=0.32,
+            min_segment=3.0,
+            max_segment=12.0,
+            segment_buffer=0.35,
+            base_rate="+0%",
+            azure_style="professional",
+            duration=20.0,
+            segments=[
+                SegmentState(
+                    id=1,
+                    start=0.0,
+                    end=2.0,
+                    duration=2.0,
+                    status=SegmentStatus.CONTENT_GENERATED,
+                    selected_draft=original,
+                    original_draft=original,
+                ),
+            ],
+        )
+        segment = manifest.segments[0]
+
+        run_qa_gate_step(manifest, segment)
+
+        assert segment.auto_retry_attempted is True
+        assert segment.rewrite_attempt_count == 1
         assert segment.status == SegmentStatus.NEEDS_HUMAN_REVIEW
-        assert segment.decision == Decision.RETRY_NARRATION
-        assert segment.human_review_status == "qa-retry-narration"
-        assert "repetitive narration" in segment.critic_feedback
+        assert segment.decision == Decision.NEEDS_HUMAN_REVIEW
+        assert segment.final_decision == Decision.NEEDS_HUMAN_REVIEW
+        assert segment.human_review_status == "qa-rewrite-failed"
+
+    def test_run_qa_gate_step_never_rewrites_more_than_once(self):
+        original = "一二三四五六七八九十一二三四五六七八九十"
+        manifest = Manifest(
+            version="2.0",
+            input_video="in.mp4",
+            output_video="out.mp4",
+            workdir="/tmp/work",
+            scene_threshold=0.32,
+            min_segment=3.0,
+            max_segment=12.0,
+            segment_buffer=0.35,
+            base_rate="+0%",
+            azure_style="professional",
+            duration=20.0,
+            segments=[
+                SegmentState(
+                    id=1,
+                    start=0.0,
+                    end=2.0,
+                    duration=2.0,
+                    status=SegmentStatus.CONTENT_GENERATED,
+                    selected_draft=original,
+                    original_draft=original,
+                    rewrite_attempt_count=1,
+                    auto_retry_attempted=True,
+                ),
+            ],
+        )
+        segment = manifest.segments[0]
+
+        run_qa_gate_step(manifest, segment)
+
+        assert segment.rewrite_attempt_count == 1
+        assert segment.status == SegmentStatus.NEEDS_HUMAN_REVIEW
+        assert segment.final_decision == Decision.RETRY_NARRATION
 
 
 class TestPolicies:
