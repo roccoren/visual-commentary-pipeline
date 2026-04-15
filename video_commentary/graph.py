@@ -10,6 +10,12 @@ Two graphs are built:
   retry edges.
 * ``build_pipeline_graph()`` — top-level graph that initialises the manifest,
   iterates over segments (invoking the segment subgraph), and finalises outputs.
+
+Enhanced capabilities (opt-in via CLI flags):
+* ``--use-content-understanding`` — Azure Content Understanding for video analysis
+* ``--use-llm-critic`` — LLM-based QA critic with rewrite loops
+* ``--use-doc-intel`` — Document Intelligence OCR for UI screenshots
+* ``--use-llm-profiler`` — LLM-based video profiling from sampled frames
 """
 
 from __future__ import annotations
@@ -96,16 +102,50 @@ def frame_extraction_step(state: SegmentProcessingState) -> dict[str, Any]:
 
 
 def vision_step(state: SegmentProcessingState) -> dict[str, Any]:
-    """Call Azure OpenAI vision to understand the segment frames."""
-    from .pipeline import run_vision_step
+    """Understand the segment frames — enhanced with multi-model fusion.
 
+    When ``use_content_understanding`` or ``use_doc_intel`` is set, delegates
+    to the multi-model :func:`vision_enricher.enrich_segment_vision`.
+    Otherwise falls back to the original Azure OpenAI vision call.
+    """
     manifest = _manifest_from_state(state)
     segment = _segment_from_manifest(manifest, state["segment_id"])
 
     if segment.status != SegmentStatus.FRAMES_EXTRACTED:
         return {}
 
-    run_vision_step(manifest, segment)
+    use_cu = state.get("use_content_understanding", False)
+    use_di = state.get("use_doc_intel", False)
+
+    if use_cu or use_di:
+        from .pipeline import get_effective_style_policy, get_previous_accepted_narration
+        from .vision_enricher import enrich_segment_vision
+
+        cu_data = state.get("cu_segment_data") or segment.vision_result
+        if cu_data and cu_data.get("source") == "content_understanding":
+            cu_data_for_enricher = cu_data
+        else:
+            cu_data_for_enricher = None
+
+        enriched = enrich_segment_vision(
+            segment,
+            cu_data=cu_data_for_enricher,
+            use_doc_intel=use_di,
+            use_gpt4o_vision=True,
+            previous_narration=get_previous_accepted_narration(manifest, state["segment_id"]),
+            style_policy=get_effective_style_policy(manifest),
+        )
+        segment.vision_result = enriched
+        segment.title = enriched.get("title", segment.title)
+        segment.visible_points = enriched.get("visible_points", segment.visible_points)
+        segment.on_screen_text = enriched.get("on_screen_text", segment.on_screen_text)
+
+        from .pipeline import _assign_semantic_groups
+        _assign_semantic_groups(manifest)
+    else:
+        from .pipeline import run_vision_step
+        run_vision_step(manifest, segment)
+
     return _save_manifest(state, manifest)
 
 
@@ -124,18 +164,105 @@ def narration_step(state: SegmentProcessingState) -> dict[str, Any]:
 
 
 def qa_gate_step(state: SegmentProcessingState) -> dict[str, Any]:
-    """Evaluate narration quality and auto-rewrite once if needed."""
-    from .pipeline import run_qa_gate_step
+    """Evaluate narration quality — two-layer when LLM critic is enabled.
+
+    Layer 1 (always): rule-based checks from ``qa_gate.py``.
+    Layer 2 (opt-in): LLM critic from ``llm_critic.py`` — runs only if rules
+    pass so that fast deterministic checks still catch obvious problems for free.
+
+    When the LLM critic fails narration and ``narration_retry_count`` is below
+    ``max_narration_retries``, it triggers an LLM-guided rewrite and
+    re-evaluates, implementing a proper critic-feedback loop.
+    """
+    from .pipeline import get_previous_accepted_narration, note_segment_decision, run_qa_gate_step
 
     manifest = _manifest_from_state(state)
     segment = _segment_from_manifest(manifest, state["segment_id"])
+    use_llm = state.get("use_llm_critic", False)
 
-    run_qa_gate_step(manifest, segment)
+    if not use_llm:
+        # Original rule-based QA gate
+        run_qa_gate_step(manifest, segment)
+        passed = segment.status == SegmentStatus.CONTENT_GENERATED
+        return {
+            **_save_manifest(state, manifest),
+            "qa_passed": passed,
+            "segment_status": segment.status.value,
+        }
 
-    passed = segment.status == SegmentStatus.CONTENT_GENERATED
+    # Two-layer QA with LLM critic
+    from .llm_critic import evaluate_narration_two_layer, rewrite_narration_llm
+
+    previous_narration = get_previous_accepted_narration(manifest, state["segment_id"])
+    max_retries = state.get("max_narration_retries", 2)
+    retry_count = state.get("narration_retry_count", 0)
+
+    passed, decision, reason, feedback, critic_result = evaluate_narration_two_layer(
+        narration=segment.selected_draft,
+        segment=segment,
+        previous_narration=previous_narration,
+        use_llm=True,
+    )
+
+    if passed:
+        segment.final_decision = Decision.ACCEPT
+        segment.critic_feedback = feedback
+        return {
+            **_save_manifest(state, manifest),
+            "qa_passed": True,
+            "segment_status": segment.status.value,
+        }
+
+    # Failed — try LLM rewrite if we have retries left
+    segment.critic_feedback = feedback
+    note_segment_decision(segment, decision=decision, reason=reason)
+
+    if critic_result and retry_count < max_retries and decision == Decision.RETRY_NARRATION:
+        rewrite_result = rewrite_narration_llm(
+            narration=segment.selected_draft,
+            segment=segment,
+            critic_result=critic_result,
+            previous_narration=previous_narration,
+        )
+
+        if rewrite_result.confidence > 0.0:
+            segment.rewritten_draft = rewrite_result.narration_zh
+            segment.selected_draft = rewrite_result.narration_zh
+            segment.draft_candidates.append(rewrite_result.narration_zh)
+            segment.rewrite_attempt_count += 1
+
+            # Re-evaluate the rewrite
+            passed2, decision2, reason2, feedback2, _ = evaluate_narration_two_layer(
+                narration=segment.selected_draft,
+                segment=segment,
+                previous_narration=previous_narration,
+                use_llm=True,
+            )
+            segment.critic_feedback = feedback2
+            note_segment_decision(
+                segment, decision=decision2,
+                reason=f"post-llm-rewrite: {reason2}",
+                details={"changes": rewrite_result.changes_made},
+            )
+
+            if passed2:
+                segment.final_decision = Decision.ACCEPT
+                return {
+                    **_save_manifest(state, manifest),
+                    "qa_passed": True,
+                    "narration_retry_count": retry_count + 1,
+                    "segment_status": segment.status.value,
+                }
+
+    # Exhausted retries or high-severity issue
+    segment.final_decision = decision
+    segment.status = SegmentStatus.NEEDS_HUMAN_REVIEW
+    segment.human_review_status = "llm-qa-failed"
+
     return {
         **_save_manifest(state, manifest),
-        "qa_passed": passed,
+        "qa_passed": False,
+        "narration_retry_count": retry_count + 1,
         "segment_status": segment.status.value,
     }
 
@@ -244,7 +371,14 @@ def build_segment_graph() -> StateGraph:
 # ---------------------------------------------------------------------------
 
 def init_pipeline(state: PipelineState) -> dict[str, Any]:
-    """Discover ffmpeg, resolve paths, load or create manifest."""
+    """Discover ffmpeg, resolve paths, load or create manifest.
+
+    When ``--use-content-understanding`` is enabled, runs Azure Content
+    Understanding analysis on the video and uses the result for segmentation.
+
+    When ``--use-llm-profiler`` is enabled, uses LLM vision analysis of
+    sampled frames for video type inference instead of filename heuristics.
+    """
     from .pipeline import (
         find_ffmpeg,
         find_ffprobe,
@@ -269,6 +403,92 @@ def init_pipeline(state: PipelineState) -> dict[str, Any]:
 
     target_segment_ids = resolve_target_segment_ids(args)
 
+    # Feature flags from CLI
+    use_cu = getattr(args, "use_content_understanding", False)
+    use_llm_critic = getattr(args, "use_llm_critic", False)
+    use_doc_intel = getattr(args, "use_doc_intel", False)
+    use_llm_profiler = getattr(args, "use_llm_profiler", False)
+
+    cu_result: dict[str, Any] = {}
+
+    # Phase 2: Content Understanding analysis (if enabled and creating new manifest)
+    if use_cu and not getattr(args, "resume_from_manifest", None) and (
+        not manifest_path.exists() or getattr(args, "force_replan", False)
+    ):
+        try:
+            from .content_understanding import analyze_video, content_understanding_to_segments
+            from .pipeline import build_manifest, ffprobe_duration
+
+            duration = ffprobe_duration(ffprobe_bin, input_video)
+            cu_result = analyze_video(input_video)
+
+            cu_segments = content_understanding_to_segments(
+                cu_result,
+                video_duration=duration,
+                min_segment=args.min_segment,
+                max_segment=args.max_segment,
+            )
+
+            if cu_segments:
+                # Build manifest from CU-derived segments
+                from .core import Segment
+
+                segments_for_manifest = [
+                    Segment(id=s.id, start=s.start, end=s.end, duration=s.duration)
+                    for s in cu_segments
+                ]
+                manifest = build_manifest(
+                    args,
+                    input_video=input_video,
+                    output_video=output_video,
+                    workdir=workdir,
+                    duration=duration,
+                    segments=segments_for_manifest,
+                )
+                # Enrich with CU metadata
+                for cu_seg in cu_segments:
+                    try:
+                        m_seg = manifest.get_segment(cu_seg.id)
+                        m_seg.title = cu_seg.title
+                        m_seg.visible_points = cu_seg.visible_points
+                        m_seg.on_screen_text = cu_seg.on_screen_text
+                        m_seg.vision_result = cu_seg.vision_result
+                        m_seg.frame_paths = cu_seg.frame_paths
+                        m_seg.status = cu_seg.status
+                    except KeyError:
+                        pass
+
+                manifest.status = "planned"
+                manifest.save(manifest_path)
+
+                validate_target_segment_ids(manifest, target_segment_ids)
+                maybe_apply_redo(manifest, args, manifest_path=manifest_path, target_segment_ids=target_segment_ids)
+                manifest.status = "running"
+                manifest.save(manifest_path)
+
+                return {
+                    "input_video": str(input_video),
+                    "output_video": str(output_video),
+                    "workdir": str(workdir),
+                    "ffmpeg_bin": ffmpeg_bin,
+                    "ffprobe_bin": ffprobe_bin,
+                    "manifest_dict": manifest.to_dict(),
+                    "manifest_path": str(manifest_path),
+                    "cu_result": cu_result,
+                    "use_content_understanding": use_cu,
+                    "use_llm_critic": use_llm_critic,
+                    "use_doc_intel": use_doc_intel,
+                    "use_llm_profiler": use_llm_profiler,
+                    "segments_total": len(manifest.segments),
+                    "current_segment_index": 0,
+                    "target_segment_ids": sorted(target_segment_ids) if target_segment_ids else None,
+                    "redo": args.redo,
+                }
+        except Exception as exc:
+            print(f"[warn] Content Understanding failed, falling back to ffmpeg: {exc}")
+            cu_result = {}
+
+    # Standard manifest creation (ffmpeg-based)
     manifest = load_or_create_manifest(
         args,
         input_video=input_video,
@@ -278,6 +498,28 @@ def init_pipeline(state: PipelineState) -> dict[str, Any]:
         ffprobe_bin=ffprobe_bin,
         manifest_path=manifest_path,
     )
+
+    # Phase 4: LLM-based video profiler (if enabled)
+    if use_llm_profiler and manifest.video_profile:
+        try:
+            from .vision_enricher import profile_video_with_llm
+
+            sample_frames = _collect_sample_frames(manifest)
+            if sample_frames:
+                llm_profile = profile_video_with_llm(
+                    sample_frames,
+                    requested_scene_threshold=args.scene_threshold,
+                    requested_min_segment=args.min_segment,
+                    requested_max_segment=args.max_segment,
+                    requested_base_rate=args.base_rate,
+                    requested_azure_style=args.azure_style,
+                )
+                if llm_profile.confidence > manifest.video_profile.confidence:
+                    manifest.video_profile = llm_profile
+                    manifest.save(manifest_path)
+        except Exception as exc:
+            print(f"[warn] LLM profiler failed, keeping heuristic profile: {exc}")
+
     validate_target_segment_ids(manifest, target_segment_ids)
     maybe_apply_redo(manifest, args, manifest_path=manifest_path, target_segment_ids=target_segment_ids)
 
@@ -292,11 +534,29 @@ def init_pipeline(state: PipelineState) -> dict[str, Any]:
         "ffprobe_bin": ffprobe_bin,
         "manifest_dict": manifest.to_dict(),
         "manifest_path": str(manifest_path),
+        "cu_result": cu_result,
+        "use_content_understanding": use_cu,
+        "use_llm_critic": use_llm_critic,
+        "use_doc_intel": use_doc_intel,
+        "use_llm_profiler": use_llm_profiler,
         "segments_total": len(manifest.segments),
         "current_segment_index": 0,
         "target_segment_ids": sorted(target_segment_ids) if target_segment_ids else None,
         "redo": args.redo,
     }
+
+
+def _collect_sample_frames(manifest: Manifest) -> list[Path]:
+    """Collect up to 8 frame paths from accepted or extracted segments."""
+    frames: list[Path] = []
+    for segment in manifest.segments:
+        for fp in segment.frame_paths:
+            p = Path(fp)
+            if p.exists():
+                frames.append(p)
+                if len(frames) >= 8:
+                    return frames
+    return frames
 
 
 def process_segments(state: PipelineState) -> dict[str, Any]:
@@ -328,13 +588,19 @@ def process_segments(state: PipelineState) -> dict[str, Any]:
             "segment_buffer": manifest.segment_buffer,
             "base_rate": manifest.base_rate,
             "azure_style": manifest.azure_style,
+            # Feature flags (Phase 2/3/4)
+            "use_content_understanding": state.get("use_content_understanding", False),
+            "use_llm_critic": state.get("use_llm_critic", False),
+            "use_doc_intel": state.get("use_doc_intel", False),
+            "cu_segment_data": {},
+            # Control flow
             "boundary_ok": True,
             "qa_passed": False,
             "duration_decision": "",
             "tts_retry_count": 0,
             "narration_retry_count": 0,
             "max_tts_retries": 1,
-            "max_narration_retries": 1,
+            "max_narration_retries": 2 if state.get("use_llm_critic", False) else 1,
             "segment_status": segment.status.value,
             "error": "",
         }

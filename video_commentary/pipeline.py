@@ -1323,6 +1323,26 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Use LangGraph StateGraph orchestration instead of the imperative loop",
     )
+    parser.add_argument(
+        "--use-content-understanding",
+        action="store_true",
+        help="Use Azure Content Understanding for video analysis instead of ffmpeg scene detection",
+    )
+    parser.add_argument(
+        "--use-llm-critic",
+        action="store_true",
+        help="Enable LLM-based QA critic with rewrite loops (requires --graph)",
+    )
+    parser.add_argument(
+        "--use-doc-intel",
+        action="store_true",
+        help="Enable Document Intelligence OCR for precise UI text extraction (requires --graph)",
+    )
+    parser.add_argument(
+        "--use-llm-profiler",
+        action="store_true",
+        help="Use LLM vision analysis for video type profiling (requires --graph)",
+    )
     return parser
 
 

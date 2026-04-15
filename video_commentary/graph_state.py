@@ -29,6 +29,17 @@ class SegmentProcessingState(TypedDict, total=False):
     base_rate: str
     azure_style: str
 
+    # Manifest persistence
+    manifest_path: str
+
+    # Content Understanding data (Phase 2)
+    cu_segment_data: dict[str, Any]
+
+    # Enhanced pipeline feature flags
+    use_content_understanding: bool
+    use_llm_critic: bool
+    use_doc_intel: bool
+
     # Control flow signals set by gate nodes
     boundary_ok: bool
     qa_passed: bool
@@ -37,9 +48,6 @@ class SegmentProcessingState(TypedDict, total=False):
     narration_retry_count: int
     max_tts_retries: int
     max_narration_retries: int
-
-    # Manifest persistence
-    manifest_path: str
 
     # Outcome
     segment_status: str  # mirrors SegmentStatus.value
@@ -64,6 +72,15 @@ class PipelineState(TypedDict, total=False):
     # Manifest as a serialisable dict (round-tripped through Manifest.to_dict/from_dict)
     manifest_dict: dict[str, Any]
     manifest_path: str
+
+    # Content Understanding raw result (Phase 2)
+    cu_result: dict[str, Any]
+
+    # Enhanced pipeline feature flags
+    use_content_understanding: bool
+    use_llm_critic: bool
+    use_doc_intel: bool
+    use_llm_profiler: bool
 
     # Segment processing tracking
     current_segment_index: int
