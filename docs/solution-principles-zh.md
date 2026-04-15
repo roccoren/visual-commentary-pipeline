@@ -18,6 +18,10 @@
 
 ## 2. 整体设计思想
 
+当前主线已经完成了 stateful executor / manifest-driven workflow；如果要继续补“先识别视频类型，再决定 segmentation + style policy”的能力，建议按最小范围推进的设计见：
+
+- [P3-mini Video Planner 设计草案](./p3-mini-video-planner-design-zh.md)
+
 整个方案可以概括成一条流水线：
 
 1. 先把视频切成一系列视觉上相对稳定的片段。

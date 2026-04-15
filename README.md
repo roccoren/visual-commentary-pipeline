@@ -7,6 +7,7 @@ Standalone Python project for generating a **基于视频画面的中文讲解�
 - [Solution principles and architecture diagram](docs/solution-principles-zh.md) (Chinese)
 - [How to use / 使用说明](docs/how-to-use-zh.md) (Chinese)
 - [Parameter tuning guide](docs/parameter-tuning-guide-zh.md) (Chinese)
+- [P3-mini Video Planner design draft](docs/p3-mini-video-planner-design-zh.md) (Chinese)
 
 ## What it does
 
