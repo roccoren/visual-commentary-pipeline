@@ -9,6 +9,7 @@ import os
 import re
 import shutil
 import subprocess
+import logging
 import textwrap
 from pathlib import Path
 from typing import Any, List
@@ -39,6 +40,8 @@ from .qa_gate import QAConfig, evaluate_narration_quality
 from .segment_policy import decide_segment_action
 from .azure_auth import azure_openai_auth_headers, cognitive_services_auth_headers, get_bearer_token
 from .state import Decision, Manifest, RetryEntry, SegmentState, SegmentStatus
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_AZURE_OPENAI_API_VERSION = "2024-10-21"
 DEFAULT_AZURE_SPEECH_VOICE = "zh-CN-XiaoxiaoNeural"
@@ -79,7 +82,13 @@ def find_ffprobe(ffmpeg_bin: str) -> str:
 
 
 def run(cmd: List[str], *, check: bool = True, capture: bool = True) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, check=check, text=True, capture_output=capture)
+    proc = subprocess.run(cmd, check=False, text=True, capture_output=capture)
+    if check and proc.returncode != 0:
+        stderr_msg = (proc.stderr or "").strip()
+        if stderr_msg:
+            logger.error("Command failed (exit %d): %s\nstderr: %s", proc.returncode, cmd[0], stderr_msg)
+        raise subprocess.CalledProcessError(proc.returncode, cmd, proc.stdout, proc.stderr)
+    return proc
 
 
 def ffprobe_duration(ffprobe_bin: str, media_path: Path) -> float:
@@ -707,39 +716,46 @@ def compose_commentary_track(
 
 
 def mux_video(ffmpeg_bin: str, video_path: Path, commentary_audio: Path, srt_path: Path, output_path: Path) -> None:
-    run(
-        [
-            ffmpeg_bin,
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-y",
-            "-i",
-            str(video_path),
-            "-i",
-            str(commentary_audio),
-            "-i",
-            str(srt_path),
-            "-map",
-            "0:v:0",
-            "-map",
-            "1:a:0",
+    has_subtitles = srt_path.exists() and srt_path.stat().st_size > 0
+    cmd = [
+        ffmpeg_bin,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        str(video_path),
+        "-i",
+        str(commentary_audio),
+    ]
+    if has_subtitles:
+        cmd += ["-i", str(srt_path)]
+    cmd += [
+        "-map",
+        "0:v:0",
+        "-map",
+        "1:a:0",
+    ]
+    if has_subtitles:
+        cmd += [
             "-map",
             "2:0",
-            "-c:v",
-            "copy",
-            "-c:a",
-            "aac",
-            "-b:a",
-            "128k",
             "-c:s",
             "mov_text",
             "-metadata:s:s:0",
             "language=zho",
-            "-shortest",
-            str(output_path),
         ]
-    )
+    cmd += [
+        "-c:v",
+        "copy",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "128k",
+        "-shortest",
+        str(output_path),
+    ]
+    run(cmd)
 
 
 def segment_state_to_narration(segment: SegmentState) -> SegmentNarration:
