@@ -145,6 +145,19 @@ visual-commentary \
   --redo narration
 ```
 
+#### 一次顺序重做多段 narration
+```bash
+visual-commentary \
+  --input input.mp4 \
+  --output out/commentary_zh.mp4 \
+  --workdir out/work \
+  --resume-from-manifest out/work/commentary_manifest.json \
+  --segment-ids 2,4,17,24,52,64 \
+  --redo narration
+```
+
+`--segment-ids` 会在同一个进程里按顺序处理这些 segment，最后只统一重建一次字幕、音轨和成片。它适合替代“同时起多个进程抢写同一个 manifest”的做法。
+
 #### 只重做某一段 TTS
 ```bash
 visual-commentary \

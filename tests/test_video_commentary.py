@@ -21,18 +21,23 @@ from video_commentary.pipeline import (
     azure_openai_uses_responses_api,
     build_azure_openai_vision_request,
     build_manifest,
+    build_arg_parser,
     extract_azure_openai_text,
     get_effective_segmentation_policy,
     get_effective_style_policy,
     get_previous_accepted_narration,
     get_previous_segment,
     load_or_create_manifest,
+    maybe_apply_redo,
     note_segment_decision,
+    parse_segment_id_list,
+    resolve_target_segment_ids,
     reset_segment_for_redo,
     rewrite_narration_once,
     run_qa_gate_step,
     segment_state_to_narration,
     should_process_segment,
+    validate_target_segment_ids,
 )
 from video_commentary.planner import VideoProfile, normalize_video_profile, plan_video_profile
 from video_commentary.qa_gate import evaluate_narration_quality
@@ -491,6 +496,95 @@ class TestStateModels:
         assert loaded.segments[0].decision == Decision.ACCEPT
         assert loaded.segments[0].retry_history[0].action == Decision.ACCEPT
 
+    def test_manifest_loads_legacy_segment_list(self, tmp_path: Path):
+        path = tmp_path / "commentary_manifest.json"
+        path.write_text(
+            json.dumps(
+                [
+                    {
+                        "id": 1,
+                        "start": 0.0,
+                        "end": 5.0,
+                        "duration": 5.0,
+                        "title": "第一页",
+                        "visible_points": ["a"],
+                        "on_screen_text": ["b"],
+                        "narration_zh": "第一页介绍。",
+                        "frame_paths": ["f1.jpg"],
+                        "audio_path": "raw1.mp3",
+                        "audio_duration": 4.8,
+                        "fitted_audio_path": "fit1.mp3",
+                        "fitted_audio_duration": 4.8,
+                    }
+                ],
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+        loaded = Manifest.load(path)
+
+        assert loaded.version == "1.0-legacy"
+        assert loaded.duration == 5.0
+        assert loaded.segments[0].status == SegmentStatus.ACCEPTED
+        assert loaded.segments[0].selected_draft == "第一页介绍。"
+        assert loaded.segments[0].fitted_audio_path == "fit1.mp3"
+
+    def test_load_or_create_manifest_accepts_legacy_resume_manifest(self, tmp_path: Path):
+        manifest_path = tmp_path / "commentary_manifest.json"
+        manifest_path.write_text(
+            json.dumps(
+                [
+                    {
+                        "id": 2,
+                        "start": 7.341,
+                        "end": 16.683,
+                        "duration": 9.342,
+                        "title": "旧格式片段",
+                        "visible_points": ["step one"],
+                        "on_screen_text": ["Run agent"],
+                        "narration_zh": "这里继续演示旧格式清单。",
+                        "frame_paths": ["frame.jpg"],
+                        "audio_path": "raw.mp3",
+                        "audio_duration": 9.0,
+                        "fitted_audio_path": "fit.mp3",
+                        "fitted_audio_duration": 9.0,
+                    }
+                ],
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+        class Args:
+            resume_from_manifest = str(manifest_path)
+            force_replan = False
+            scene_threshold = 0.32
+            min_segment = 3.0
+            max_segment = 12.0
+            segment_buffer = 0.35
+            base_rate = "+0%"
+            azure_style = "professional"
+
+        loaded = load_or_create_manifest(
+            Args(),
+            input_video=tmp_path / "input.mp4",
+            output_video=tmp_path / "output.mp4",
+            workdir=tmp_path,
+            ffmpeg_bin="ffmpeg",
+            ffprobe_bin="ffprobe",
+            manifest_path=tmp_path / "unused.json",
+        )
+
+        assert loaded.version == "1.0-legacy"
+        assert loaded.input_video == str(tmp_path / "input.mp4")
+        assert loaded.output_video == str(tmp_path / "output.mp4")
+        assert loaded.workdir == str(tmp_path)
+        assert loaded.segments[0].id == 2
+        assert loaded.segments[0].status == SegmentStatus.ACCEPTED
+
     def test_segment_state_to_narration(self):
         segment = SegmentState(
             id=3,
@@ -798,13 +892,138 @@ class TestResumeRedoHelpers:
         accepted = SegmentState(id=1, start=0.0, end=1.0, duration=1.0, status=SegmentStatus.ACCEPTED)
         pending = SegmentState(id=2, start=1.0, end=2.0, duration=1.0, status=SegmentStatus.PENDING)
 
-        assert should_process_segment(accepted, redo=None, target_segment_id=None) is False
-        assert should_process_segment(pending, redo=None, target_segment_id=None) is True
+        assert should_process_segment(accepted, redo=None, target_segment_ids=None) is False
+        assert should_process_segment(pending, redo=None, target_segment_ids=None) is True
 
     def test_should_process_segment_honors_target_and_redo(self):
         accepted = SegmentState(id=7, start=0.0, end=1.0, duration=1.0, status=SegmentStatus.ACCEPTED)
-        assert should_process_segment(accepted, redo="tts", target_segment_id=7) is True
-        assert should_process_segment(accepted, redo="tts", target_segment_id=8) is False
+        assert should_process_segment(accepted, redo="tts", target_segment_ids={7, 9}) is True
+        assert should_process_segment(accepted, redo="tts", target_segment_ids={8, 9}) is False
+
+    def test_parse_segment_id_list(self):
+        assert parse_segment_id_list("2, 4,17") == [2, 4, 17]
+
+    def test_resolve_target_segment_ids_merges_single_and_multi(self):
+        args = build_arg_parser().parse_args(
+            [
+                "--input",
+                "in.mp4",
+                "--output",
+                "out.mp4",
+                "--workdir",
+                "work",
+                "--segment-id",
+                "7",
+                "--segment-ids",
+                "2,4,7",
+            ]
+        )
+
+        assert resolve_target_segment_ids(args) == {2, 4, 7}
+
+    def test_resolve_target_segment_ids_requires_target_for_redo(self):
+        args = build_arg_parser().parse_args(
+            [
+                "--input",
+                "in.mp4",
+                "--output",
+                "out.mp4",
+                "--workdir",
+                "work",
+                "--redo",
+                "narration",
+            ]
+        )
+
+        try:
+            resolve_target_segment_ids(args)
+        except SystemExit as exc:
+            assert str(exc) == "--redo requires --segment-id or --segment-ids"
+        else:  # pragma: no cover
+            raise AssertionError("expected SystemExit for redo without segment target")
+
+    def test_maybe_apply_redo_resets_multiple_target_segments(self, tmp_path: Path):
+        manifest_path = tmp_path / "commentary_manifest.json"
+        manifest = Manifest(
+            version="2.0",
+            input_video="in.mp4",
+            output_video="out.mp4",
+            workdir=str(tmp_path),
+            scene_threshold=0.32,
+            min_segment=3.0,
+            max_segment=12.0,
+            segment_buffer=0.35,
+            base_rate="+0%",
+            azure_style="professional",
+            duration=20.0,
+            segments=[
+                SegmentState(
+                    id=2,
+                    start=0.0,
+                    end=5.0,
+                    duration=5.0,
+                    status=SegmentStatus.ACCEPTED,
+                    selected_draft="seg2",
+                    raw_audio_path="raw2.mp3",
+                    fitted_audio_path="fit2.mp3",
+                ),
+                SegmentState(
+                    id=4,
+                    start=5.0,
+                    end=10.0,
+                    duration=5.0,
+                    status=SegmentStatus.ACCEPTED,
+                    selected_draft="seg4",
+                    raw_audio_path="raw4.mp3",
+                    fitted_audio_path="fit4.mp3",
+                ),
+                SegmentState(
+                    id=5,
+                    start=10.0,
+                    end=15.0,
+                    duration=5.0,
+                    status=SegmentStatus.ACCEPTED,
+                    selected_draft="seg5",
+                    raw_audio_path="raw5.mp3",
+                    fitted_audio_path="fit5.mp3",
+                ),
+            ],
+        )
+
+        class Args:
+            redo = "narration"
+
+        maybe_apply_redo(manifest, Args(), manifest_path=manifest_path, target_segment_ids={2, 4})
+
+        assert manifest.get_segment(2).status == SegmentStatus.FRAMES_EXTRACTED
+        assert manifest.get_segment(4).status == SegmentStatus.FRAMES_EXTRACTED
+        assert manifest.get_segment(5).status == SegmentStatus.ACCEPTED
+
+    def test_validate_target_segment_ids_rejects_unknown_ids(self):
+        manifest = Manifest(
+            version="2.0",
+            input_video="in.mp4",
+            output_video="out.mp4",
+            workdir=".",
+            scene_threshold=0.32,
+            min_segment=3.0,
+            max_segment=12.0,
+            segment_buffer=0.35,
+            base_rate="+0%",
+            azure_style="professional",
+            duration=20.0,
+            segments=[
+                SegmentState(id=2, start=0.0, end=5.0, duration=5.0),
+                SegmentState(id=4, start=5.0, end=10.0, duration=5.0),
+            ],
+        )
+
+        try:
+            validate_target_segment_ids(manifest, {2, 17})
+        except SystemExit as exc:
+            assert str(exc) == "Unknown segment id(s): 17"
+        else:  # pragma: no cover
+            raise AssertionError("expected SystemExit for unknown target segment ids")
 
     def test_reset_segment_for_redo(self):
         segment = SegmentState(

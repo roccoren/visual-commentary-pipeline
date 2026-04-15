@@ -107,6 +107,20 @@ visual-commentary \
   --redo narration
 ```
 
+Redo multiple segments in one sequential run:
+
+```bash
+visual-commentary \
+  --input input.mp4 \
+  --output out/commentary_zh.mp4 \
+  --workdir out/work \
+  --resume-from-manifest out/work/commentary_manifest.json \
+  --segment-ids 2,4,17,24,52,64 \
+  --redo narration
+```
+
+`--segment-ids` runs the selected segments sequentially inside one process and then rebuilds the final outputs once. It is intended as the safe alternative to launching multiple processes against the same manifest.
+
 Redo semantics are explicit:
 - `--redo vision` → reset the selected segment's derived frame/vision/narration/audio state and rerun that segment from visual understanding onward
 - `--redo narration` → reuse extracted frames, regenerate narration + QA + rewrite + TTS for that segment

@@ -134,6 +134,42 @@ class SegmentState:
             errors=list(data.get("errors", [])),
         )
 
+    @classmethod
+    def from_legacy_dict(cls, data: dict[str, Any]) -> "SegmentState":
+        selected_draft = str(data.get("narration_zh", ""))
+        raw_audio_path = str(data.get("audio_path", ""))
+        fitted_audio_path = str(data.get("fitted_audio_path", ""))
+        if fitted_audio_path and selected_draft:
+            status = SegmentStatus.ACCEPTED
+        elif raw_audio_path and selected_draft:
+            status = SegmentStatus.TTS_GENERATED
+        elif selected_draft:
+            status = SegmentStatus.CONTENT_GENERATED
+        elif data.get("frame_paths"):
+            status = SegmentStatus.FRAMES_EXTRACTED
+        else:
+            status = SegmentStatus.PENDING
+
+        return cls(
+            id=int(data["id"]),
+            start=float(data["start"]),
+            end=float(data["end"]),
+            duration=float(data["duration"]),
+            status=status,
+            frame_paths=list(data.get("frame_paths", [])),
+            title=str(data.get("title", "")),
+            visible_points=list(data.get("visible_points", [])),
+            on_screen_text=list(data.get("on_screen_text", [])),
+            selected_draft=selected_draft,
+            original_draft=selected_draft,
+            raw_audio_path=raw_audio_path,
+            raw_audio_duration=float(data.get("audio_duration", 0.0)),
+            fitted_audio_path=fitted_audio_path,
+            fitted_audio_duration=float(data.get("fitted_audio_duration", 0.0)),
+            decision=Decision.ACCEPT if status == SegmentStatus.ACCEPTED else None,
+            final_decision=Decision.ACCEPT if status == SegmentStatus.ACCEPTED else None,
+        )
+
 
 @dataclass
 class Manifest:
@@ -192,6 +228,40 @@ class Manifest:
             segments=[SegmentState.from_dict(item) for item in data.get("segments", [])],
         )
 
+    @classmethod
+    def from_legacy_segments(
+        cls,
+        segments: list[dict[str, Any]],
+        *,
+        source_path: Path | None = None,
+    ) -> "Manifest":
+        workdir = source_path.parent if source_path else Path(".")
+        duration = max((float(item.get("end", 0.0)) for item in segments), default=0.0)
+        return cls(
+            version="1.0-legacy",
+            input_video="",
+            output_video="",
+            workdir=str(workdir),
+            scene_threshold=0.32,
+            min_segment=3.0,
+            max_segment=12.0,
+            segment_buffer=0.35,
+            base_rate="+0%",
+            azure_style="professional",
+            duration=duration,
+            status="legacy-imported",
+            artifacts={"manifest": str(source_path)} if source_path else {},
+            segments=[SegmentState.from_legacy_dict(item) for item in segments],
+        )
+
+    @classmethod
+    def from_json_data(cls, data: Any, *, source_path: Path | None = None) -> "Manifest":
+        if isinstance(data, dict):
+            return cls.from_dict(data)
+        if isinstance(data, list):
+            return cls.from_legacy_segments(data, source_path=source_path)
+        raise TypeError(f"Unsupported manifest payload type: {type(data).__name__}")
+
     def save(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp_path = path.with_suffix(path.suffix + ".tmp")
@@ -200,7 +270,7 @@ class Manifest:
 
     @classmethod
     def load(cls, path: Path) -> "Manifest":
-        return cls.from_dict(json.loads(path.read_text(encoding="utf-8")))
+        return cls.from_json_data(json.loads(path.read_text(encoding="utf-8")), source_path=path)
 
     def get_segment(self, segment_id: int) -> SegmentState:
         for segment in self.segments:

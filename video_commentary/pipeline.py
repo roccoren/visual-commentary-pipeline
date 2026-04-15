@@ -599,8 +599,42 @@ def get_previous_accepted_narration(manifest: Manifest, segment_id: int) -> str:
     return previous_text
 
 
-def should_process_segment(segment: SegmentState, *, redo: str | None, target_segment_id: int | None) -> bool:
-    if target_segment_id is not None and segment.id != target_segment_id:
+def parse_segment_id_list(value: str) -> list[int]:
+    ids: list[int] = []
+    for part in value.split(","):
+        token = part.strip()
+        if not token:
+            raise argparse.ArgumentTypeError("segment ids must be a comma-separated list of integers")
+        try:
+            ids.append(int(token))
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError("segment ids must be a comma-separated list of integers") from exc
+    if not ids:
+        raise argparse.ArgumentTypeError("segment ids must not be empty")
+    return ids
+
+
+def resolve_target_segment_ids(args: argparse.Namespace) -> set[int] | None:
+    target_segment_ids = set(args.segment_ids or [])
+    if args.segment_id is not None:
+        target_segment_ids.add(args.segment_id)
+    if args.redo and not target_segment_ids:
+        raise SystemExit("--redo requires --segment-id or --segment-ids")
+    return target_segment_ids or None
+
+
+def validate_target_segment_ids(manifest: Manifest, target_segment_ids: set[int] | None) -> None:
+    if target_segment_ids is None:
+        return
+    available_ids = {segment.id for segment in manifest.segments}
+    missing_ids = sorted(segment_id for segment_id in target_segment_ids if segment_id not in available_ids)
+    if missing_ids:
+        missing_text = ", ".join(str(segment_id) for segment_id in missing_ids)
+        raise SystemExit(f"Unknown segment id(s): {missing_text}")
+
+
+def should_process_segment(segment: SegmentState, *, redo: str | None, target_segment_ids: set[int] | None) -> bool:
+    if target_segment_ids is not None and segment.id not in target_segment_ids:
         return False
     if redo:
         return True
@@ -998,30 +1032,31 @@ def load_or_create_manifest(
     ffprobe_bin: str,
     manifest_path: Path,
 ) -> Manifest:
+    def prepare_loaded_manifest(loaded: Manifest) -> Manifest:
+        loaded.input_video = str(input_video)
+        loaded.output_video = str(output_video)
+        loaded.workdir = str(workdir)
+        if not loaded.duration:
+            loaded.duration = ffprobe_duration(ffprobe_bin, input_video)
+        if loaded.version.startswith("1."):
+            loaded.segment_buffer = args.segment_buffer
+            loaded.base_rate = args.base_rate
+            loaded.azure_style = args.azure_style
+        if loaded.video_profile:
+            loaded.video_profile = normalize_video_profile(
+                loaded.video_profile,
+                requested_scene_threshold=args.scene_threshold,
+                requested_min_segment=args.min_segment,
+                requested_max_segment=args.max_segment,
+                requested_base_rate=args.base_rate,
+                requested_azure_style=args.azure_style,
+            )
+        return loaded
+
     if args.resume_from_manifest:
-        loaded = Manifest.load(Path(args.resume_from_manifest).expanduser().resolve())
-        if loaded.video_profile:
-            loaded.video_profile = normalize_video_profile(
-                loaded.video_profile,
-                requested_scene_threshold=args.scene_threshold,
-                requested_min_segment=args.min_segment,
-                requested_max_segment=args.max_segment,
-                requested_base_rate=args.base_rate,
-                requested_azure_style=args.azure_style,
-            )
-        return loaded
+        return prepare_loaded_manifest(Manifest.load(Path(args.resume_from_manifest).expanduser().resolve()))
     if manifest_path.exists() and not args.force_replan:
-        loaded = Manifest.load(manifest_path)
-        if loaded.video_profile:
-            loaded.video_profile = normalize_video_profile(
-                loaded.video_profile,
-                requested_scene_threshold=args.scene_threshold,
-                requested_min_segment=args.min_segment,
-                requested_max_segment=args.max_segment,
-                requested_base_rate=args.base_rate,
-                requested_azure_style=args.azure_style,
-            )
-        return loaded
+        return prepare_loaded_manifest(Manifest.load(manifest_path))
 
     duration = ffprobe_duration(ffprobe_bin, input_video)
     try:
@@ -1071,23 +1106,31 @@ def load_or_create_manifest(
     return manifest
 
 
-def maybe_apply_redo(manifest: Manifest, args: argparse.Namespace, *, manifest_path: Path) -> None:
-    if args.segment_id is None or args.redo is None:
+def maybe_apply_redo(
+    manifest: Manifest,
+    args: argparse.Namespace,
+    *,
+    manifest_path: Path,
+    target_segment_ids: set[int] | None,
+) -> None:
+    if target_segment_ids is None or args.redo is None:
         return
 
-    target = manifest.get_segment(args.segment_id)
-    reset_segment_for_redo(target, args.redo)
-    note_segment_decision(
-        target,
-        decision=Decision.RETRY_NARRATION if args.redo in {"vision", "narration"} else Decision.RETRY_TTS,
-        reason=f"manual redo requested: {args.redo}",
-    )
+    for segment_id in sorted(target_segment_ids):
+        target = manifest.get_segment(segment_id)
+        reset_segment_for_redo(target, args.redo)
+        note_segment_decision(
+            target,
+            decision=Decision.RETRY_NARRATION if args.redo in {"vision", "narration"} else Decision.RETRY_TTS,
+            reason=f"manual redo requested: {args.redo}",
+        )
     manifest.save(manifest_path)
 
 
 def narrate_video(args: argparse.Namespace) -> dict:
     ffmpeg_bin = find_ffmpeg()
     ffprobe_bin = find_ffprobe(ffmpeg_bin)
+    target_segment_ids = resolve_target_segment_ids(args)
 
     input_video = Path(args.input).expanduser().resolve()
     output_video = Path(args.output).expanduser().resolve()
@@ -1110,13 +1153,14 @@ def narrate_video(args: argparse.Namespace) -> dict:
         ffprobe_bin=ffprobe_bin,
         manifest_path=manifest_path,
     )
-    maybe_apply_redo(manifest, args, manifest_path=manifest_path)
+    validate_target_segment_ids(manifest, target_segment_ids)
+    maybe_apply_redo(manifest, args, manifest_path=manifest_path, target_segment_ids=target_segment_ids)
 
     manifest.status = "running"
     manifest.save(manifest_path)
 
     for segment in manifest.segments:
-        if not should_process_segment(segment, redo=args.redo, target_segment_id=args.segment_id):
+        if not should_process_segment(segment, redo=args.redo, target_segment_ids=target_segment_ids):
             continue
 
         process_segment(
@@ -1179,6 +1223,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--segment-id",
         type=int,
         help="Restrict processing to one segment id",
+    )
+    parser.add_argument(
+        "--segment-ids",
+        type=parse_segment_id_list,
+        help="Restrict processing to a comma-separated list of segment ids",
     )
     parser.add_argument(
         "--redo",
