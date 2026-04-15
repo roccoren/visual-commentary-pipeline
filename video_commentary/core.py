@@ -6,7 +6,7 @@ import html
 import json
 import math
 import re
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable, List, Mapping, Sequence
 
