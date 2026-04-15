@@ -740,6 +740,61 @@ def run_frame_extraction_step(
     segment.status = SegmentStatus.FRAMES_EXTRACTED
 
 
+def _clean_transition_text(text: str) -> str:
+    cleaned = (text or "").strip()
+    for token in ("上一页", "下一页", "接下来", "基于前面", "如前所述"):
+        cleaned = cleaned.replace(token, "")
+    return " ".join(cleaned.split())
+
+
+def _derive_semantic_group_title(segment: SegmentState) -> str:
+    title = _clean_transition_text(segment.title)
+    if title:
+        return title
+    if segment.visible_points:
+        return _clean_transition_text(segment.visible_points[0])
+    if segment.on_screen_text:
+        return _clean_transition_text(segment.on_screen_text[0])
+    return f"segment_{segment.id}"
+
+
+def _same_semantic_group(left: SegmentState, right: SegmentState) -> bool:
+    left_key = _derive_semantic_group_title(left)
+    right_key = _derive_semantic_group_title(right)
+    return bool(left_key and right_key and left_key == right_key)
+
+
+def _assign_semantic_groups(manifest: Manifest) -> None:
+    if not manifest.segments:
+        return
+    current_group = "group_001"
+    manifest.segments[0].semantic_group = current_group
+    for index in range(1, len(manifest.segments)):
+        previous = manifest.segments[index - 1]
+        current = manifest.segments[index]
+        if _same_semantic_group(previous, current):
+            current.semantic_group = previous.semantic_group
+        else:
+            current_group = f"group_{index + 1:03d}"
+            current.semantic_group = current_group
+
+    groups: dict[str, list[SegmentState]] = {}
+    for segment in manifest.segments:
+        groups.setdefault(segment.semantic_group or f"group_{segment.id:03d}", []).append(segment)
+
+    for group_segments in groups.values():
+        if len(group_segments) == 1:
+            group_segments[0].narrative_role = "single"
+            continue
+        for pos, item in enumerate(group_segments):
+            if pos == 0:
+                item.narrative_role = "open"
+            elif pos == len(group_segments) - 1:
+                item.narrative_role = "close"
+            else:
+                item.narrative_role = "continue"
+
+
 def run_vision_step(manifest: Manifest, segment: SegmentState) -> None:
     vision = call_azure_openai_vision(
         frame_paths=[Path(path) for path in segment.frame_paths],
@@ -751,10 +806,30 @@ def run_vision_step(manifest: Manifest, segment: SegmentState) -> None:
     segment.title = vision["title"]
     segment.visible_points = vision["visible_points"]
     segment.on_screen_text = vision["on_screen_text"]
+    _assign_semantic_groups(manifest)
 
 
-def run_narration_step(segment: SegmentState) -> None:
-    narration = normalize_terms(str(segment.vision_result.get("narration_zh", "这里展示了当前画面的核心内容。")))
+def _build_group_aware_narration(manifest: Manifest, segment: SegmentState) -> str:
+    base = _clean_transition_text(str(segment.vision_result.get("narration_zh", "这里展示了当前画面的核心内容。")))
+    if not base:
+        base = "这里展示了当前画面的核心内容。"
+    role = segment.narrative_role or "single"
+    topic = _derive_semantic_group_title(segment)
+    previous_segment = get_previous_segment(manifest, segment.id)
+
+    if role == "open" and topic and topic not in base:
+        return normalize_terms(f"这一部分先看{topic}。{base}")
+    if role in {"continue", "close"}:
+        return normalize_terms(base)
+    if previous_segment and previous_segment.semantic_group != segment.semantic_group:
+        if topic:
+            return normalize_terms(f"这里再看{topic}。{base}")
+        return normalize_terms(f"换到这一部分，{base}")
+    return normalize_terms(base)
+
+
+def run_narration_step(manifest: Manifest, segment: SegmentState) -> None:
+    narration = _build_group_aware_narration(manifest, segment)
     segment.draft_candidates = [narration]
     segment.selected_draft = narration
     segment.original_draft = narration
@@ -778,6 +853,10 @@ def rewrite_narration_once(
             rewritten = "这里进一步展示了与上一段不同的当前操作细节。"
         else:
             rewritten = f"这里进一步说明当前画面的新增内容：{rewritten}".strip()
+    elif "explicit transition phrasing" in critic_feedback:
+        rewritten = _clean_transition_text(rewritten)
+        if not rewritten:
+            rewritten = "这里继续说明当前部分的核心内容。"
     elif "too long or too dense narration" in critic_feedback:
         max_chars = max(18, min(90, int(duration_seconds * 8)))
         rewritten = rewritten[:max_chars].rstrip("，、；： ")
@@ -950,7 +1029,7 @@ def process_segment(
         if segment.status == SegmentStatus.FRAMES_EXTRACTED:
             run_vision_step(manifest, segment)
             manifest.save(manifest_path)
-            run_narration_step(segment)
+            run_narration_step(manifest, segment)
             manifest.save(manifest_path)
             run_qa_gate_step(manifest, segment)
             manifest.save(manifest_path)

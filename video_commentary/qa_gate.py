@@ -4,6 +4,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+EXPLICIT_TRANSITION_BANNED_TOKENS = (
+    "上一页",
+    "下一页",
+    "接下来",
+    "基于前面",
+    "如前所述",
+)
+
 from .state import Decision
 
 
@@ -49,6 +57,20 @@ def evaluate_narration_quality(
             reason="narration duplicates the previous accepted segment",
             feedback=["repetitive narration"],
             details={"char_count": char_count, "duration_seconds": round(duration_seconds, 3)},
+        )
+
+    banned_hits = [token for token in EXPLICIT_TRANSITION_BANNED_TOKENS if token in cleaned]
+    if banned_hits:
+        return QAGateResult(
+            passed=False,
+            decision=Decision.RETRY_NARRATION,
+            reason="narration uses explicit slide-to-slide transition phrasing",
+            feedback=["explicit transition phrasing"],
+            details={
+                "char_count": char_count,
+                "duration_seconds": round(duration_seconds, 3),
+                "banned_hits": ",".join(banned_hits),
+            },
         )
 
     if char_count > max_chars * 1.5 or chars_per_second > 12.0:

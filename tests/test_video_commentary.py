@@ -16,6 +16,8 @@ from video_commentary.core import (
 )
 from video_commentary.duration_policy import decide_duration_action
 from video_commentary.pipeline import (
+    _assign_semantic_groups,
+    _build_group_aware_narration,
     accepted_narrations_from_manifest,
     accepted_segments_from_manifest,
     azure_openai_uses_responses_api,
@@ -704,6 +706,16 @@ class TestQAGate:
         assert result.decision == Decision.RETRY_NARRATION
         assert "repetitive narration" in result.feedback
 
+    def test_explicit_transition_phrasing_requests_retry(self):
+        result = evaluate_narration_quality(
+            narration="接下来我们看这一页的 Azure 门户配置。",
+            previous_narration="上一段不同内容",
+            duration_seconds=5.0,
+        )
+        assert result.passed is False
+        assert result.decision == Decision.RETRY_NARRATION
+        assert "explicit transition phrasing" in result.feedback
+
     def test_too_dense_narration_requests_retry_or_review(self):
         retry_result = evaluate_narration_quality(
             narration="这是一段明显过长的讲解文案" * 5,
@@ -788,6 +800,41 @@ class TestQAGate:
         assert segment.rewritten_draft != "上一段"
         assert segment.final_decision == Decision.ACCEPT
 
+    def test_run_qa_gate_step_rewrites_explicit_transition_once_and_passes(self):
+        manifest = Manifest(
+            version="2.0",
+            input_video="in.mp4",
+            output_video="out.mp4",
+            workdir="/tmp/work",
+            scene_threshold=0.32,
+            min_segment=3.0,
+            max_segment=12.0,
+            segment_buffer=0.35,
+            base_rate="+0%",
+            azure_style="professional",
+            duration=20.0,
+            segments=[
+                SegmentState(
+                    id=1,
+                    start=0.0,
+                    end=4.0,
+                    duration=4.0,
+                    status=SegmentStatus.CONTENT_GENERATED,
+                    selected_draft="接下来我们看这一页的 Azure 门户配置。",
+                    original_draft="接下来我们看这一页的 Azure 门户配置。",
+                ),
+            ],
+        )
+        segment = manifest.segments[0]
+
+        run_qa_gate_step(manifest, segment)
+
+        assert segment.status == SegmentStatus.CONTENT_GENERATED
+        assert segment.auto_retry_attempted is True
+        assert segment.rewrite_attempt_count == 1
+        assert "接下来" not in segment.rewritten_draft
+        assert segment.final_decision == Decision.ACCEPT
+
     def test_run_qa_gate_step_too_dense_after_rewrite_needs_review(self):
         original = "一二三四五六七八九十一二三四五六七八九十"
         manifest = Manifest(
@@ -860,6 +907,91 @@ class TestQAGate:
         assert segment.rewrite_attempt_count == 1
         assert segment.status == SegmentStatus.NEEDS_HUMAN_REVIEW
         assert segment.final_decision == Decision.RETRY_NARRATION
+
+
+class TestGroupAwareNarration:
+    def test_assign_semantic_groups_marks_roles_by_adjacent_titles(self):
+        manifest = Manifest(
+            version="2.0",
+            input_video="in.mp4",
+            output_video="out.mp4",
+            workdir="/tmp/work",
+            scene_threshold=0.32,
+            min_segment=3.0,
+            max_segment=12.0,
+            segment_buffer=0.35,
+            base_rate="+0%",
+            azure_style="professional",
+            duration=20.0,
+            segments=[
+                SegmentState(id=1, start=0.0, end=4.0, duration=4.0, title="系统架构"),
+                SegmentState(id=2, start=4.0, end=8.0, duration=4.0, title="系统架构"),
+                SegmentState(id=3, start=8.0, end=12.0, duration=4.0, title="业务价值"),
+            ],
+        )
+
+        _assign_semantic_groups(manifest)
+
+        assert manifest.segments[0].semantic_group == manifest.segments[1].semantic_group
+        assert manifest.segments[2].semantic_group != manifest.segments[1].semantic_group
+        assert manifest.segments[0].narrative_role == "open"
+        assert manifest.segments[1].narrative_role == "close"
+        assert manifest.segments[2].narrative_role == "single"
+
+    def test_build_group_aware_narration_adds_cross_group_bridge_only(self):
+        manifest = Manifest(
+            version="2.0",
+            input_video="in.mp4",
+            output_video="out.mp4",
+            workdir="/tmp/work",
+            scene_threshold=0.32,
+            min_segment=3.0,
+            max_segment=12.0,
+            segment_buffer=0.35,
+            base_rate="+0%",
+            azure_style="professional",
+            duration=20.0,
+            segments=[
+                SegmentState(
+                    id=1,
+                    start=0.0,
+                    end=4.0,
+                    duration=4.0,
+                    title="系统架构",
+                    semantic_group="group_001",
+                    narrative_role="open",
+                    vision_result={"narration_zh": "展示系统整体组成。"},
+                ),
+                SegmentState(
+                    id=2,
+                    start=4.0,
+                    end=8.0,
+                    duration=4.0,
+                    title="系统架构",
+                    semantic_group="group_001",
+                    narrative_role="close",
+                    vision_result={"narration_zh": "说明数据如何进入推理链路。"},
+                ),
+                SegmentState(
+                    id=3,
+                    start=8.0,
+                    end=12.0,
+                    duration=4.0,
+                    title="业务价值",
+                    semantic_group="group_002",
+                    narrative_role="single",
+                    vision_result={"narration_zh": "总结收益与业务价值。"},
+                ),
+            ],
+        )
+
+        first = _build_group_aware_narration(manifest, manifest.segments[0])
+        second = _build_group_aware_narration(manifest, manifest.segments[1])
+        third = _build_group_aware_narration(manifest, manifest.segments[2])
+
+        assert "这一部分先看系统架构" in first
+        assert "上一页" not in second and "接下来" not in second
+        assert any(token in third for token in ["这里再看", "换到这一部分"])
 
 
 class TestPolicies:

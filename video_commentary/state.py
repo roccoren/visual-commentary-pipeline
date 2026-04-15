@@ -48,6 +48,8 @@ class SegmentState:
     status: SegmentStatus = SegmentStatus.PENDING
     frame_paths: list[str] = field(default_factory=list)
     title: str = ""
+    semantic_group: str = ""
+    narrative_role: str = ""
     visible_points: list[str] = field(default_factory=list)
     on_screen_text: list[str] = field(default_factory=list)
     vision_result: dict[str, Any] = field(default_factory=dict)
@@ -110,6 +112,8 @@ class SegmentState:
             status=SegmentStatus(data.get("status", SegmentStatus.PENDING.value)),
             frame_paths=list(data.get("frame_paths", [])),
             title=str(data.get("title", "")),
+            semantic_group=str(data.get("semantic_group", "")),
+            narrative_role=str(data.get("narrative_role", "")),
             visible_points=list(data.get("visible_points", [])),
             on_screen_text=list(data.get("on_screen_text", [])),
             vision_result=dict(data.get("vision_result", {})),
@@ -158,6 +162,8 @@ class SegmentState:
             status=status,
             frame_paths=list(data.get("frame_paths", [])),
             title=str(data.get("title", "")),
+            semantic_group=str(data.get("semantic_group", "")),
+            narrative_role=str(data.get("narrative_role", "")),
             visible_points=list(data.get("visible_points", [])),
             on_screen_text=list(data.get("on_screen_text", [])),
             selected_draft=selected_draft,
