@@ -208,5 +208,26 @@ def build_azure_tts_ssml(
 
 
 def serialize_manifest(narrations: Sequence[SegmentNarration]) -> str:
-    return json.dumps([asdict(item) for item in narrations], ensure_ascii=False, indent=2)
+    return json.dumps(
+        [
+            {
+                "id": item.id,
+                "start": item.start,
+                "end": item.end,
+                "duration": item.duration,
+                "title": item.title,
+                "visible_points": item.visible_points,
+                "on_screen_text": item.on_screen_text,
+                "narration_zh": item.narration_zh,
+                "frame_paths": item.frame_paths,
+                "audio_path": item.audio_path,
+                "audio_duration": item.audio_duration,
+                "fitted_audio_path": item.fitted_audio_path,
+                "fitted_audio_duration": item.fitted_audio_duration,
+            }
+            for item in narrations
+        ],
+        ensure_ascii=False,
+        indent=2,
+    )
 
