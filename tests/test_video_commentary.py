@@ -20,9 +20,13 @@ from video_commentary.pipeline import (
     accepted_segments_from_manifest,
     azure_openai_uses_responses_api,
     build_azure_openai_vision_request,
+    build_manifest,
     extract_azure_openai_text,
+    get_effective_segmentation_policy,
+    get_effective_style_policy,
     get_previous_accepted_narration,
     get_previous_segment,
+    load_or_create_manifest,
     note_segment_decision,
     reset_segment_for_redo,
     rewrite_narration_once,
@@ -30,6 +34,7 @@ from video_commentary.pipeline import (
     segment_state_to_narration,
     should_process_segment,
 )
+from video_commentary.planner import VideoProfile, normalize_video_profile, plan_video_profile
 from video_commentary.qa_gate import evaluate_narration_quality
 from video_commentary.segment_policy import decide_segment_action
 from video_commentary.state import Decision, Manifest, RetryEntry, SegmentState, SegmentStatus
@@ -212,6 +217,241 @@ class TestAzureOpenAIResponseParsing:
         }
 
         assert extract_azure_openai_text(body, "chat_completions") == '{"narration_zh": "这里继续演示配置过程。"}'
+
+
+class TestVideoPlanner:
+    def test_video_profile_round_trip_through_manifest(self, tmp_path: Path):
+        profile = VideoProfile(
+            video_type="portal_walkthrough",
+            confidence=0.82,
+            segmentation_policy={"scene_threshold": 0.36, "min_segment": 2.5, "max_segment": 9.0},
+            style_policy={
+                "narration_density": "balanced",
+                "narration_focus": "operation_step",
+                "azure_style": "professional",
+                "base_rate": "+2%",
+            },
+            rationale=["screen is portal-like"],
+        )
+        manifest = Manifest(
+            version="2.0",
+            input_video="in.mp4",
+            output_video="out.mp4",
+            workdir=str(tmp_path),
+            scene_threshold=0.32,
+            min_segment=3.0,
+            max_segment=12.0,
+            segment_buffer=0.35,
+            base_rate="+0%",
+            azure_style="professional",
+            duration=20.0,
+            video_profile=profile,
+            segments=[],
+        )
+
+        path = tmp_path / "manifest.json"
+        manifest.save(path)
+        loaded = Manifest.load(path)
+
+        assert loaded.video_profile is not None
+        assert loaded.video_profile.video_type == "portal_walkthrough"
+        assert loaded.video_profile.style_policy["base_rate"] == "+2%"
+
+    def test_normalize_video_profile_fallback_whitelist_and_clamp(self):
+        profile = normalize_video_profile(
+            {
+                "video_type": "unknown_type",
+                "confidence": 2.4,
+                "segmentation_policy": {"scene_threshold": 0.9, "min_segment": 0.2, "max_segment": 0.5},
+                "style_policy": {
+                    "narration_density": "verbose",
+                    "narration_focus": "everything",
+                    "azure_style": "professional",
+                    "base_rate": "+99%",
+                },
+            },
+            requested_scene_threshold=0.32,
+            requested_min_segment=3.0,
+            requested_max_segment=12.0,
+            requested_base_rate="+0%",
+            requested_azure_style="professional",
+        )
+
+        assert profile.video_type == "mixed_visual_demo"
+        assert profile.confidence == 1.0
+        assert profile.segmentation_policy["scene_threshold"] == 0.5
+        assert profile.segmentation_policy["min_segment"] == 1.0
+        assert profile.segmentation_policy["max_segment"] >= profile.segmentation_policy["min_segment"]
+        assert profile.style_policy["narration_density"] == "balanced"
+        assert profile.style_policy["narration_focus"] == "screen_change"
+        assert profile.style_policy["base_rate"] == "+25%"
+
+    def test_plan_video_profile_infers_known_video_type(self):
+        profile = plan_video_profile(
+            input_video=Path("azure-portal-demo.mp4"),
+            requested_scene_threshold=0.32,
+            requested_min_segment=3.0,
+            requested_max_segment=12.0,
+            requested_base_rate="+0%",
+            requested_azure_style="professional",
+        )
+
+        assert profile.video_type == "portal_walkthrough"
+        assert profile.style_policy["narration_focus"] == "operation_step"
+
+    def test_effective_policy_helpers_read_from_manifest_video_profile(self):
+        profile = VideoProfile(
+            video_type="portal_walkthrough",
+            confidence=0.8,
+            segmentation_policy={"scene_threshold": 0.36, "min_segment": 2.5, "max_segment": 9.0},
+            style_policy={
+                "narration_density": "balanced",
+                "narration_focus": "operation_step",
+                "azure_style": "professional",
+                "base_rate": "+2%",
+            },
+            rationale=[],
+        )
+        manifest = Manifest(
+            version="2.0",
+            input_video="in.mp4",
+            output_video="out.mp4",
+            workdir="/tmp/work",
+            scene_threshold=0.32,
+            min_segment=3.0,
+            max_segment=12.0,
+            segment_buffer=0.35,
+            base_rate="+0%",
+            azure_style="calm",
+            duration=20.0,
+            video_profile=profile,
+            segments=[],
+        )
+
+        assert get_effective_segmentation_policy(manifest) == {
+            "scene_threshold": 0.36,
+            "min_segment": 2.5,
+            "max_segment": 9.0,
+        }
+        assert get_effective_style_policy(manifest)["base_rate"] == "+2%"
+        assert get_effective_style_policy(manifest)["azure_style"] == "professional"
+
+    def test_load_or_create_manifest_reuses_existing_profile_on_resume(self, tmp_path: Path, monkeypatch):
+        manifest_path = tmp_path / "commentary_manifest.json"
+        manifest = Manifest(
+            version="2.0",
+            input_video="in.mp4",
+            output_video="out.mp4",
+            workdir=str(tmp_path),
+            scene_threshold=0.36,
+            min_segment=2.5,
+            max_segment=9.0,
+            segment_buffer=0.35,
+            base_rate="+2%",
+            azure_style="professional",
+            duration=20.0,
+            video_profile=VideoProfile(
+                video_type="portal_walkthrough",
+                confidence=0.8,
+                segmentation_policy={"scene_threshold": 0.36, "min_segment": 2.5, "max_segment": 9.0},
+                style_policy={
+                    "narration_density": "balanced",
+                    "narration_focus": "operation_step",
+                    "azure_style": "professional",
+                    "base_rate": "+2%",
+                },
+                rationale=["saved from previous run"],
+            ),
+            segments=[],
+        )
+        manifest.save(manifest_path)
+
+        class Args:
+            resume_from_manifest = None
+            force_replan = False
+            scene_threshold = 0.32
+            min_segment = 3.0
+            max_segment = 12.0
+            segment_buffer = 0.35
+            base_rate = "+0%"
+            azure_style = "calm"
+
+        def should_not_plan(**kwargs):
+            raise AssertionError("planner should not rerun when manifest already has video_profile")
+
+        monkeypatch.setattr("video_commentary.pipeline.plan_video_profile", should_not_plan)
+
+        loaded = load_or_create_manifest(
+            Args(),
+            input_video=tmp_path / "input.mp4",
+            output_video=tmp_path / "output.mp4",
+            workdir=tmp_path,
+            ffmpeg_bin="ffmpeg",
+            ffprobe_bin="ffprobe",
+            manifest_path=manifest_path,
+        )
+
+        assert loaded.video_profile is not None
+        assert loaded.video_profile.video_type == "portal_walkthrough"
+        assert loaded.video_profile.style_policy["base_rate"] == "+2%"
+
+    def test_load_or_create_manifest_applies_planner_policy_to_manifest_defaults(self, tmp_path: Path, monkeypatch):
+        input_video = tmp_path / "azure-portal-demo.mp4"
+        output_video = tmp_path / "output.mp4"
+        manifest_path = tmp_path / "commentary_manifest.json"
+        input_video.write_bytes(b"fake")
+
+        class Args:
+            resume_from_manifest = None
+            force_replan = False
+            scene_threshold = 0.32
+            min_segment = 3.0
+            max_segment = 12.0
+            segment_buffer = 0.35
+            base_rate = "+0%"
+            azure_style = "calm"
+
+        monkeypatch.setattr("video_commentary.pipeline.ffprobe_duration", lambda *_args, **_kwargs: 20.0)
+        monkeypatch.setattr("video_commentary.pipeline.detect_scene_cuts", lambda *_args, **_kwargs: [5.0, 10.0])
+        monkeypatch.setattr(
+            "video_commentary.pipeline.build_segments",
+            lambda duration, cuts, min_segment, max_segment: [
+                Segment(id=1, start=0.0, end=5.0, duration=5.0),
+                Segment(id=2, start=5.0, end=10.0, duration=5.0),
+            ],
+        )
+        monkeypatch.setattr(
+            "video_commentary.pipeline.plan_video_profile",
+            lambda **_kwargs: VideoProfile(
+                video_type="portal_walkthrough",
+                confidence=0.8,
+                segmentation_policy={"scene_threshold": 0.36, "min_segment": 2.5, "max_segment": 9.0},
+                style_policy={
+                    "narration_density": "balanced",
+                    "narration_focus": "operation_step",
+                    "azure_style": "professional",
+                    "base_rate": "+2%",
+                },
+                rationale=["planner test profile"],
+            ),
+        )
+
+        loaded = load_or_create_manifest(
+            Args(),
+            input_video=input_video,
+            output_video=output_video,
+            workdir=tmp_path,
+            ffmpeg_bin="ffmpeg",
+            ffprobe_bin="ffprobe",
+            manifest_path=manifest_path,
+        )
+
+        assert loaded.video_profile is not None
+        assert loaded.scene_threshold == 0.36
+        assert loaded.min_segment == 2.5
+        assert loaded.max_segment == 9.0
+        assert loaded.base_rate == "+2%"
+        assert loaded.azure_style == "professional"
 
 
 class TestStateModels:

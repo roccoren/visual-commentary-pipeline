@@ -34,6 +34,7 @@ from .core import (
     write_srt_file,
 )
 from .duration_policy import decide_duration_action
+from .planner import VideoProfile, normalize_video_profile, plan_video_profile
 from .qa_gate import evaluate_narration_quality
 from .segment_policy import decide_segment_action
 from .state import Decision, Manifest, RetryEntry, SegmentState, SegmentStatus
@@ -237,12 +238,53 @@ def raise_for_status_with_context(response: requests.Response) -> None:
         ) from exc
 
 
-def call_azure_openai_vision(*, frame_paths: List[Path], segment: SegmentState, previous_narration: str) -> dict:
+def get_effective_video_profile(manifest: Manifest) -> VideoProfile | None:
+    return manifest.video_profile
+
+
+def get_effective_segmentation_policy(manifest: Manifest) -> dict[str, float]:
+    profile = get_effective_video_profile(manifest)
+    if not profile:
+        return {
+            "scene_threshold": manifest.scene_threshold,
+            "min_segment": manifest.min_segment,
+            "max_segment": manifest.max_segment,
+        }
+    policy = profile.segmentation_policy
+    return {
+        "scene_threshold": float(policy.get("scene_threshold", manifest.scene_threshold)),
+        "min_segment": float(policy.get("min_segment", manifest.min_segment)),
+        "max_segment": float(policy.get("max_segment", manifest.max_segment)),
+    }
+
+
+def get_effective_style_policy(manifest: Manifest) -> dict[str, str]:
+    profile = get_effective_video_profile(manifest)
+    if not profile:
+        return {
+            "narration_density": "balanced",
+            "narration_focus": "screen_change",
+            "azure_style": manifest.azure_style,
+            "base_rate": manifest.base_rate,
+        }
+    policy = profile.style_policy
+    return {
+        "narration_density": str(policy.get("narration_density", "balanced")),
+        "narration_focus": str(policy.get("narration_focus", "screen_change")),
+        "azure_style": str(policy.get("azure_style", manifest.azure_style)),
+        "base_rate": str(policy.get("base_rate", manifest.base_rate)),
+    }
+
+
+def call_azure_openai_vision(*, frame_paths: List[Path], segment: SegmentState, previous_narration: str, style_policy: dict[str, str] | None = None) -> dict:
     endpoint = env_required("AZURE_OPENAI_ENDPOINT").rstrip("/")
     api_key = env_required("AZURE_OPENAI_API_KEY")
     deployment = env_required("AZURE_OPENAI_DEPLOYMENT")
     api_version = os.getenv("AZURE_OPENAI_API_VERSION", DEFAULT_AZURE_OPENAI_API_VERSION)
 
+    style_policy = style_policy or {}
+    narration_density = style_policy.get("narration_density", "balanced")
+    narration_focus = style_policy.get("narration_focus", "screen_change")
     max_chars = max(18, min(90, int(segment.duration * 8)))
     user_prompt = textwrap.dedent(
         f"""
@@ -255,6 +297,7 @@ def call_azure_openai_vision(*, frame_paths: List[Path], segment: SegmentState, 
         4. 讲解必须能在大约 {segment.duration:.1f} 秒内说完，尽量控制在 {max_chars} 个中文字符以内。
         5. 如画面信息很少，就简短说明“这里继续展示/演示……”。
         6. 专名保持英文，例如 Azure AI Foundry、OpenAI、Mistral、Cohere、DeepSeek、GitHub、Copilot Studio。
+        7. 当前 narration_density={narration_density}，narration_focus={narration_focus}。
 
         时间窗：{segment.start:.3f}s - {segment.end:.3f}s
         上一段讲解：{previous_narration or '无'}
@@ -496,6 +539,7 @@ def build_manifest(
     workdir: Path,
     duration: float,
     segments: List[Segment],
+    video_profile: VideoProfile | None = None,
 ) -> Manifest:
     return Manifest(
         version=MANIFEST_VERSION,
@@ -509,6 +553,7 @@ def build_manifest(
         base_rate=args.base_rate,
         azure_style=args.azure_style,
         duration=round(duration, 3),
+        video_profile=video_profile,
         status="planned",
         artifacts={},
         segments=[
@@ -666,6 +711,7 @@ def run_vision_step(manifest: Manifest, segment: SegmentState) -> None:
         frame_paths=[Path(path) for path in segment.frame_paths],
         segment=segment,
         previous_narration=get_previous_accepted_narration(manifest, segment.id),
+        style_policy=get_effective_style_policy(manifest),
     )
     segment.vision_result = vision
     segment.title = vision["title"]
@@ -876,14 +922,15 @@ def process_segment(
             manifest.save(manifest_path)
 
         if segment.status == SegmentStatus.CONTENT_GENERATED:
+            style_policy = get_effective_style_policy(manifest)
             run_tts_step(
                 segment,
                 raw_audio_dir=raw_audio_dir,
                 fit_audio_dir=fit_audio_dir,
                 ffmpeg_bin=ffmpeg_bin,
                 ffprobe_bin=ffprobe_bin,
-                base_rate=args.base_rate,
-                azure_style=args.azure_style,
+                base_rate=style_policy["base_rate"],
+                azure_style=style_policy["azure_style"],
                 segment_buffer=args.segment_buffer,
             )
             manifest.save(manifest_path)
@@ -952,17 +999,58 @@ def load_or_create_manifest(
     manifest_path: Path,
 ) -> Manifest:
     if args.resume_from_manifest:
-        return Manifest.load(Path(args.resume_from_manifest).expanduser().resolve())
+        loaded = Manifest.load(Path(args.resume_from_manifest).expanduser().resolve())
+        if loaded.video_profile:
+            loaded.video_profile = normalize_video_profile(
+                loaded.video_profile,
+                requested_scene_threshold=args.scene_threshold,
+                requested_min_segment=args.min_segment,
+                requested_max_segment=args.max_segment,
+                requested_base_rate=args.base_rate,
+                requested_azure_style=args.azure_style,
+            )
+        return loaded
     if manifest_path.exists() and not args.force_replan:
-        return Manifest.load(manifest_path)
+        loaded = Manifest.load(manifest_path)
+        if loaded.video_profile:
+            loaded.video_profile = normalize_video_profile(
+                loaded.video_profile,
+                requested_scene_threshold=args.scene_threshold,
+                requested_min_segment=args.min_segment,
+                requested_max_segment=args.max_segment,
+                requested_base_rate=args.base_rate,
+                requested_azure_style=args.azure_style,
+            )
+        return loaded
 
     duration = ffprobe_duration(ffprobe_bin, input_video)
-    cuts = detect_scene_cuts(ffmpeg_bin, input_video, args.scene_threshold)
+    try:
+        video_profile = plan_video_profile(
+            input_video=input_video,
+            requested_scene_threshold=args.scene_threshold,
+            requested_min_segment=args.min_segment,
+            requested_max_segment=args.max_segment,
+            requested_base_rate=args.base_rate,
+            requested_azure_style=args.azure_style,
+        )
+    except Exception as exc:
+        video_profile = normalize_video_profile(
+            None,
+            requested_scene_threshold=args.scene_threshold,
+            requested_min_segment=args.min_segment,
+            requested_max_segment=args.max_segment,
+            requested_base_rate=args.base_rate,
+            requested_azure_style=args.azure_style,
+        )
+        video_profile.rationale.append(f"planner fallback due to error: {exc}")
+
+    segmentation_policy = video_profile.segmentation_policy
+    cuts = detect_scene_cuts(ffmpeg_bin, input_video, float(segmentation_policy["scene_threshold"]))
     segments = build_segments(
         duration,
         cuts,
-        min_segment=args.min_segment,
-        max_segment=args.max_segment,
+        min_segment=float(segmentation_policy["min_segment"]),
+        max_segment=float(segmentation_policy["max_segment"]),
     )
     manifest = build_manifest(
         args,
@@ -971,7 +1059,14 @@ def load_or_create_manifest(
         workdir=workdir,
         duration=duration,
         segments=segments,
+        video_profile=video_profile,
     )
+    manifest.scene_threshold = float(segmentation_policy["scene_threshold"])
+    manifest.min_segment = float(segmentation_policy["min_segment"])
+    manifest.max_segment = float(segmentation_policy["max_segment"])
+    style_policy = video_profile.style_policy
+    manifest.base_rate = str(style_policy["base_rate"])
+    manifest.azure_style = str(style_policy["azure_style"])
     manifest.save(manifest_path)
     return manifest
 
