@@ -16,6 +16,7 @@ from .core import (
 )
 from .graph import build_pipeline_graph, build_segment_graph, narrate_video_graph
 from .graph_state import PipelineState, SegmentProcessingState
+from .pipeline import build_context_window, generate_narrative_outline, polish_narrations_for_coherence
 from .planner import VideoProfile, normalize_video_profile, plan_video_profile
 from .qa_gate import QAGateResult, evaluate_narration_quality
 from .state import Decision, Manifest, SegmentState, SegmentStatus
@@ -34,16 +35,19 @@ __all__ = [
     "SegmentStatus",
     "atempo_chain",
     "build_azure_tts_ssml",
+    "build_context_window",
     "build_pipeline_graph",
     "build_segment_graph",
     "build_segments",
     "build_srt_text",
     "evaluate_narration_quality",
     "format_srt_timestamp",
+    "generate_narrative_outline",
     "narrate_video_graph",
     "normalize_terms",
     "normalize_video_profile",
     "plan_video_profile",
+    "polish_narrations_for_coherence",
     "sample_times",
     "serialize_manifest",
     "write_srt_file",

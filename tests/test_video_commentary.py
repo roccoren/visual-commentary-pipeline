@@ -1187,3 +1187,240 @@ class TestResumeRedoHelpers:
         reset_segment_for_redo(segment, "vision")
         assert segment.status == SegmentStatus.PENDING
         assert segment.frame_paths == []
+
+
+class TestNarrativeCoherence:
+    """Tests for the three-pass narrative coherence system."""
+
+    def _make_manifest(self, **kwargs):
+        defaults = dict(
+            version="2.0",
+            input_video="in.mp4",
+            output_video="out.mp4",
+            workdir="/tmp/work",
+            scene_threshold=0.32,
+            min_segment=3.0,
+            max_segment=12.0,
+            segment_buffer=0.35,
+            base_rate="+0%",
+            azure_style="professional",
+            duration=30.0,
+        )
+        defaults.update(kwargs)
+        return Manifest(**defaults)
+
+    # --- _summarize_segment_for_outline ---
+
+    def test_summarize_segment_for_outline_with_title_and_points(self):
+        from video_commentary.pipeline import _summarize_segment_for_outline
+
+        seg = SegmentState(
+            id=1, start=0.0, end=5.0, duration=5.0,
+            title="Azure Portal 首页",
+            visible_points=["导航栏", "搜索框", "创建资源"],
+        )
+        summary = _summarize_segment_for_outline(seg)
+        assert "[1]" in summary
+        assert "Azure Portal 首页" in summary
+        assert "导航栏" in summary
+        assert "0.0-5.0s" in summary
+
+    def test_summarize_segment_for_outline_without_points(self):
+        from video_commentary.pipeline import _summarize_segment_for_outline
+
+        seg = SegmentState(id=2, start=5.0, end=10.0, duration=5.0, title="部署页面")
+        summary = _summarize_segment_for_outline(seg)
+        assert "部署页面" in summary
+        assert "|" not in summary
+
+    def test_summarize_segment_for_outline_no_title(self):
+        from video_commentary.pipeline import _summarize_segment_for_outline
+
+        seg = SegmentState(id=3, start=10.0, end=15.0, duration=5.0)
+        summary = _summarize_segment_for_outline(seg)
+        assert "segment_3" in summary
+
+    # --- build_context_window ---
+
+    def test_build_context_window_returns_surrounding_summaries(self):
+        from video_commentary.pipeline import build_context_window
+
+        manifest = self._make_manifest(
+            segments=[
+                SegmentState(id=1, start=0.0, end=4.0, duration=4.0, title="概览", selected_draft="这是概览。"),
+                SegmentState(id=2, start=4.0, end=8.0, duration=4.0, title="详细步骤"),
+                SegmentState(id=3, start=8.0, end=12.0, duration=4.0, title="总结", selected_draft="总结全文。"),
+            ],
+        )
+        ctx = build_context_window(manifest, 2)
+        assert "前1" in ctx
+        assert "概览" in ctx
+        assert "后1" in ctx
+        assert "总结" in ctx
+
+    def test_build_context_window_edge_first_segment(self):
+        from video_commentary.pipeline import build_context_window
+
+        manifest = self._make_manifest(
+            segments=[
+                SegmentState(id=1, start=0.0, end=4.0, duration=4.0, title="首段"),
+                SegmentState(id=2, start=4.0, end=8.0, duration=4.0, title="次段"),
+            ],
+        )
+        ctx = build_context_window(manifest, 1)
+        assert "前" not in ctx
+        assert "后1" in ctx
+        assert "次段" in ctx
+
+    def test_build_context_window_unknown_segment(self):
+        from video_commentary.pipeline import build_context_window
+
+        manifest = self._make_manifest(segments=[SegmentState(id=1, start=0.0, end=4.0, duration=4.0)])
+        ctx = build_context_window(manifest, 999)
+        assert ctx == ""
+
+    def test_build_context_window_custom_window_size(self):
+        from video_commentary.pipeline import build_context_window
+
+        segments = [
+            SegmentState(id=i, start=float(i * 4), end=float((i + 1) * 4), duration=4.0, title=f"段{i}")
+            for i in range(1, 8)
+        ]
+        manifest = self._make_manifest(segments=segments, duration=28.0)
+        ctx = build_context_window(manifest, 4, window_size=1)
+        parts = ctx.split(" | ")
+        assert len(parts) == 2
+
+    # --- _build_group_aware_narration with outline ---
+
+    def test_build_group_aware_narration_skips_templates_with_outline(self):
+        manifest = self._make_manifest(
+            narrative_outline="这是全局大纲。",
+            segments=[
+                SegmentState(
+                    id=1, start=0.0, end=4.0, duration=4.0,
+                    title="系统架构",
+                    semantic_group="group_001",
+                    narrative_role="open",
+                    vision_result={"narration_zh": "展示系统整体组成。"},
+                ),
+                SegmentState(
+                    id=2, start=4.0, end=8.0, duration=4.0,
+                    title="业务价值",
+                    semantic_group="group_002",
+                    narrative_role="single",
+                    vision_result={"narration_zh": "总结收益与业务价值。"},
+                ),
+            ],
+        )
+        first = _build_group_aware_narration(manifest, manifest.segments[0])
+        second = _build_group_aware_narration(manifest, manifest.segments[1])
+
+        # With outline present, templates are skipped
+        assert "这一部分先看" not in first
+        assert "这里再看" not in second
+        assert "展示系统整体组成" in first
+        assert "总结收益与业务价值" in second
+
+    def test_build_group_aware_narration_uses_templates_without_outline(self):
+        manifest = self._make_manifest(
+            segments=[
+                SegmentState(
+                    id=1, start=0.0, end=4.0, duration=4.0,
+                    title="系统架构",
+                    semantic_group="group_001",
+                    narrative_role="open",
+                    vision_result={"narration_zh": "展示组成。"},
+                ),
+            ],
+        )
+        assert manifest.narrative_outline == ""
+        first = _build_group_aware_narration(manifest, manifest.segments[0])
+        assert "这一部分先看系统架构" in first
+
+    # --- Manifest serialization of narrative_outline ---
+
+    def test_manifest_serializes_narrative_outline(self):
+        manifest = self._make_manifest(narrative_outline="全局大纲文本。")
+        data = manifest.to_dict()
+        assert data["narrative_outline"] == "全局大纲文本。"
+        restored = Manifest.from_dict(data)
+        assert restored.narrative_outline == "全局大纲文本。"
+
+    def test_manifest_defaults_narrative_outline_empty(self):
+        manifest = self._make_manifest()
+        assert manifest.narrative_outline == ""
+        data = manifest.to_dict()
+        restored = Manifest.from_dict(data)
+        assert restored.narrative_outline == ""
+
+    # --- CLI flag ---
+
+    def test_arg_parser_has_skip_coherence(self):
+        parser = build_arg_parser()
+        args = parser.parse_args([
+            "--input", "in.mp4",
+            "--output", "out.mp4",
+            "--workdir", "/tmp",
+            "--skip-coherence",
+        ])
+        assert args.skip_coherence is True
+
+    def test_arg_parser_skip_coherence_defaults_false(self):
+        parser = build_arg_parser()
+        args = parser.parse_args([
+            "--input", "in.mp4",
+            "--output", "out.mp4",
+            "--workdir", "/tmp",
+        ])
+        assert args.skip_coherence is False
+
+    # --- polish_narrations_for_coherence offline (no API) ---
+
+    def test_polish_narrations_skips_single_segment(self):
+        from video_commentary.pipeline import polish_narrations_for_coherence
+
+        manifest = self._make_manifest(
+            segments=[
+                SegmentState(
+                    id=1, start=0.0, end=5.0, duration=5.0,
+                    status=SegmentStatus.CONTENT_GENERATED,
+                    selected_draft="唯一一段旁白。",
+                ),
+            ],
+        )
+        assert polish_narrations_for_coherence(manifest) == 0
+
+    def test_polish_narrations_skips_empty_drafts(self):
+        from video_commentary.pipeline import polish_narrations_for_coherence
+
+        manifest = self._make_manifest(
+            segments=[
+                SegmentState(id=1, start=0.0, end=5.0, duration=5.0, status=SegmentStatus.CONTENT_GENERATED),
+                SegmentState(id=2, start=5.0, end=10.0, duration=5.0, status=SegmentStatus.CONTENT_GENERATED),
+            ],
+        )
+        assert polish_narrations_for_coherence(manifest) == 0
+
+    # --- generate_narrative_outline offline (no API) ---
+
+    def test_generate_outline_skips_fewer_than_two_segments(self):
+        from video_commentary.pipeline import generate_narrative_outline
+
+        manifest = self._make_manifest(
+            segments=[
+                SegmentState(id=1, start=0.0, end=5.0, duration=5.0, title="单段"),
+            ],
+        )
+        assert generate_narrative_outline(manifest) == ""
+
+    def test_generate_outline_skips_segments_without_titles(self):
+        from video_commentary.pipeline import generate_narrative_outline
+
+        manifest = self._make_manifest(
+            segments=[
+                SegmentState(id=1, start=0.0, end=5.0, duration=5.0),
+                SegmentState(id=2, start=5.0, end=10.0, duration=5.0),
+            ],
+        )
+        assert generate_narrative_outline(manifest) == ""

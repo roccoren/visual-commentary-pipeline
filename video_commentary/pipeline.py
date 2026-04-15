@@ -276,7 +276,217 @@ def get_effective_style_policy(manifest: Manifest) -> dict[str, str]:
     }
 
 
-def call_azure_openai_vision(*, frame_paths: List[Path], segment: SegmentState, previous_narration: str, style_policy: dict[str, str] | None = None) -> dict:
+# ---------------------------------------------------------------------------
+# Pass 0: Global Narrative Outline
+# ---------------------------------------------------------------------------
+
+def _summarize_segment_for_outline(seg: SegmentState) -> str:
+    """Build a compact summary line for one segment, used in outline generation."""
+    title = seg.title or f"segment_{seg.id}"
+    points = ", ".join(seg.visible_points[:3]) if seg.visible_points else ""
+    return f"[{seg.id}] {seg.start:.1f}-{seg.end:.1f}s ({seg.duration:.1f}s) {title}" + (f" | {points}" if points else "")
+
+
+def generate_narrative_outline(manifest: Manifest) -> str:
+    """Call Azure OpenAI to produce a global narrative outline from all segment summaries.
+
+    This gives every subsequent per-segment narration call awareness of the
+    full video arc, eliminating the "each segment is an island" problem.
+    """
+    segments_with_vision = [
+        seg for seg in manifest.segments
+        if seg.title and seg.status not in (SegmentStatus.SKIPPED, SegmentStatus.FAILED)
+    ]
+    if len(segments_with_vision) < 2:
+        return ""
+
+    summaries = "\n".join(_summarize_segment_for_outline(seg) for seg in segments_with_vision)
+    total_duration = manifest.duration
+
+    prompt = textwrap.dedent(
+        f"""
+        你是一位专业的视频旁白策划编辑。下面是一段 {total_duration:.0f} 秒的视频，
+        已被切分为 {len(segments_with_vision)} 个片段，每个片段已完成画面分析。
+
+        请根据以下片段摘要，生成一份"全局叙事大纲"，指导后续逐段旁白生成。
+
+        要求：
+        1. 用 2-4 句话概述整个视频的主题和叙事弧线。
+        2. 为每个片段写一句话的叙述方向指引（重点讲什么、与前后段如何衔接）。
+        3. 标注哪些片段之间需要自然过渡、哪些是主题切换点。
+        4. 整体口吻要像一个人在流畅地讲解，不要机械地逐段描述。
+        5. 不要生成具体旁白文字，只做策划指引。
+
+        片段摘要：
+        {summaries}
+
+        直接输出大纲文本，不要 JSON 格式，不要 markdown 标记。
+        """
+    ).strip()
+
+    endpoint = env_required("AZURE_OPENAI_ENDPOINT").rstrip("/")
+    api_key = env_required("AZURE_OPENAI_API_KEY")
+    deployment = env_required("AZURE_OPENAI_DEPLOYMENT")
+    api_version = os.getenv("AZURE_OPENAI_API_VERSION", DEFAULT_AZURE_OPENAI_API_VERSION)
+
+    payload = {
+        "messages": [
+            {"role": "system", "content": "你是专业的中文视频叙事策划编辑。"},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.3,
+        "max_tokens": 1200,
+    }
+
+    url = f"{endpoint}/openai/deployments/{deployment}/chat/completions?api-version={api_version}"
+    response = requests.post(
+        url,
+        headers={"api-key": api_key, "Content-Type": "application/json"},
+        json=payload,
+        timeout=120,
+    )
+    raise_for_status_with_context(response)
+    outline = response.json()["choices"][0]["message"]["content"].strip()
+    return outline
+
+
+# ---------------------------------------------------------------------------
+# Sliding window context for per-segment narration
+# ---------------------------------------------------------------------------
+
+def build_context_window(manifest: Manifest, segment_id: int, *, window_size: int = 2) -> str:
+    """Return a compact summary of surrounding segments for richer context."""
+    all_segs = manifest.segments
+    idx = next((i for i, s in enumerate(all_segs) if s.id == segment_id), None)
+    if idx is None:
+        return ""
+
+    parts: list[str] = []
+    start = max(0, idx - window_size)
+    end = min(len(all_segs), idx + window_size + 1)
+    for i in range(start, end):
+        seg = all_segs[i]
+        if i == idx:
+            continue
+        label = "前" if i < idx else "后"
+        distance = abs(i - idx)
+        title = seg.title or f"segment_{seg.id}"
+        narration = seg.selected_draft[:40] if seg.selected_draft else ""
+        line = f"({label}{distance}) [{seg.id}] {title}"
+        if narration:
+            line += f" → {narration}"
+        parts.append(line)
+
+    return " | ".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Pass 2: Post-generation coherence polish
+# ---------------------------------------------------------------------------
+
+def polish_narrations_for_coherence(manifest: Manifest) -> int:
+    """Review all accepted narrations together and smooth transitions.
+
+    Returns the number of segments whose narration was revised.
+    """
+    accepted = [
+        seg for seg in manifest.segments
+        if seg.status in (SegmentStatus.CONTENT_GENERATED, SegmentStatus.ACCEPTED, SegmentStatus.TTS_GENERATED)
+        and seg.selected_draft
+    ]
+    if len(accepted) < 2:
+        return 0
+
+    narration_lines = []
+    for seg in accepted:
+        max_chars = max(18, min(90, int(seg.duration * 8)))
+        narration_lines.append(
+            f"[{seg.id}] ({seg.duration:.1f}s, max {max_chars} chars) {seg.selected_draft}"
+        )
+    all_narrations = "\n".join(narration_lines)
+
+    prompt = textwrap.dedent(
+        f"""
+        你是视频旁白润色编辑。下面是一段视频的全部分段旁白（已按时间顺序排列）。
+
+        请审阅并润色，使整体听起来像一个人在流畅自然地讲解，而不是多段拼接。
+
+        润色原则：
+        1. 消除相邻段落之间的重复表述。
+        2. 优化段落衔接——如果两段之间主题连贯，用自然口语过渡；如果主题切换，用简洁的切换提示。
+        3. 保持每段的字数约束（括号中标注了时长和字数上限），不要大幅超出。
+        4. 不要改变原文的核心信息，只做衔接和风格层面的润色。
+        5. 专名保持英文原文（Azure、OpenAI、DeepSeek 等）。
+        6. 如果某段旁白已经很好，保持不变即可。
+
+        当前旁白：
+        {all_narrations}
+
+        请以 JSON 数组格式返回，每个元素包含 segment_id 和 narration_zh。
+        只返回有修改的段落。如果全部无需修改，返回空数组 []。
+        格式：[{{"segment_id": 1, "narration_zh": "润色后的文本"}}, ...]
+        不要 markdown，不要额外解释，只返回 JSON 数组。
+        """
+    ).strip()
+
+    endpoint = env_required("AZURE_OPENAI_ENDPOINT").rstrip("/")
+    api_key = env_required("AZURE_OPENAI_API_KEY")
+    deployment = env_required("AZURE_OPENAI_DEPLOYMENT")
+    api_version = os.getenv("AZURE_OPENAI_API_VERSION", DEFAULT_AZURE_OPENAI_API_VERSION)
+
+    payload = {
+        "messages": [
+            {"role": "system", "content": "你是专业的中文视频旁白润色编辑。只返回 JSON。"},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.2,
+        "max_tokens": 2000,
+    }
+
+    url = f"{endpoint}/openai/deployments/{deployment}/chat/completions?api-version={api_version}"
+    response = requests.post(
+        url,
+        headers={"api-key": api_key, "Content-Type": "application/json"},
+        json=payload,
+        timeout=180,
+    )
+    raise_for_status_with_context(response)
+    raw = response.json()["choices"][0]["message"]["content"].strip()
+
+    try:
+        revisions = json.loads(raw)
+    except json.JSONDecodeError:
+        match = re.search(r"\[.*\]", raw, re.S)
+        if not match:
+            return 0
+        revisions = json.loads(match.group(0))
+
+    if not isinstance(revisions, list):
+        return 0
+
+    revised_count = 0
+    seg_map = {seg.id: seg for seg in manifest.segments}
+    for item in revisions:
+        seg_id = int(item.get("segment_id", -1))
+        new_narration = normalize_terms(str(item.get("narration_zh", "")))
+        if seg_id in seg_map and new_narration:
+            seg = seg_map[seg_id]
+            if new_narration != seg.selected_draft:
+                seg.selected_draft = new_narration
+                seg.draft_candidates.append(new_narration)
+                # Reset TTS so the polished narration gets re-synthesized
+                if seg.status in (SegmentStatus.TTS_GENERATED, SegmentStatus.ACCEPTED):
+                    seg.status = SegmentStatus.CONTENT_GENERATED
+                    seg.raw_audio_path = ""
+                    seg.raw_audio_duration = 0.0
+                    seg.fitted_audio_path = ""
+                    seg.fitted_audio_duration = 0.0
+                revised_count += 1
+
+    return revised_count
+
+
+def call_azure_openai_vision(*, frame_paths: List[Path], segment: SegmentState, previous_narration: str, style_policy: dict[str, str] | None = None, narrative_outline: str = "", context_window: str = "") -> dict:
     endpoint = env_required("AZURE_OPENAI_ENDPOINT").rstrip("/")
     api_key = env_required("AZURE_OPENAI_API_KEY")
     deployment = env_required("AZURE_OPENAI_DEPLOYMENT")
@@ -286,6 +496,20 @@ def call_azure_openai_vision(*, frame_paths: List[Path], segment: SegmentState, 
     narration_density = style_policy.get("narration_density", "balanced")
     narration_focus = style_policy.get("narration_focus", "screen_change")
     max_chars = max(18, min(90, int(segment.duration * 8)))
+
+    outline_block = ""
+    if narrative_outline:
+        outline_block = (
+            "\n        全局叙事大纲（请参考整体脉络来决定本段重点和过渡方式）：\n"
+            f"        {narrative_outline}\n"
+        )
+    context_block = ""
+    if context_window:
+        context_block = (
+            "\n        周围段落摘要（用于衍接上下文）：\n"
+            f"        {context_window}\n"
+        )
+
     user_prompt = textwrap.dedent(
         f"""
         你是视频讲解编辑。请仅根据提供的关键帧，为这一段视频生成“基于画面的中文讲解”。
@@ -298,7 +522,8 @@ def call_azure_openai_vision(*, frame_paths: List[Path], segment: SegmentState, 
         5. 如画面信息很少，就简短说明“这里继续展示/演示……”。
         6. 专名保持英文，例如 Azure AI Foundry、OpenAI、Mistral、Cohere、DeepSeek、GitHub、Copilot Studio。
         7. 当前 narration_density={narration_density}，narration_focus={narration_focus}。
-
+        8. 请确保本段讲解与前后段落自然衍接，避免生硬的过渡词（如“上一页”“下一页”），用自然口语过渡。
+{outline_block}{context_block}
         时间窗：{segment.start:.3f}s - {segment.end:.3f}s
         上一段讲解：{previous_narration or '无'}
 
@@ -801,6 +1026,8 @@ def run_vision_step(manifest: Manifest, segment: SegmentState) -> None:
         segment=segment,
         previous_narration=get_previous_accepted_narration(manifest, segment.id),
         style_policy=get_effective_style_policy(manifest),
+        narrative_outline=manifest.narrative_outline,
+        context_window=build_context_window(manifest, segment.id),
     )
     segment.vision_result = vision
     segment.title = vision["title"]
@@ -813,6 +1040,13 @@ def _build_group_aware_narration(manifest: Manifest, segment: SegmentState) -> s
     base = _clean_transition_text(str(segment.vision_result.get("narration_zh", "这里展示了当前画面的核心内容。")))
     if not base:
         base = "这里展示了当前画面的核心内容。"
+
+    # When a narrative outline exists, the vision model already received
+    # full-video context and produced naturally flowing narration — skip
+    # the template-based transition injection.
+    if manifest.narrative_outline:
+        return normalize_terms(base)
+
     role = segment.narrative_role or "single"
     topic = _derive_semantic_group_title(segment)
     previous_segment = get_previous_segment(manifest, segment.id)
@@ -1210,6 +1444,7 @@ def narrate_video(args: argparse.Namespace) -> dict:
     ffmpeg_bin = find_ffmpeg()
     ffprobe_bin = find_ffprobe(ffmpeg_bin)
     target_segment_ids = resolve_target_segment_ids(args)
+    skip_coherence = getattr(args, "skip_coherence", False)
 
     input_video = Path(args.input).expanduser().resolve()
     output_video = Path(args.output).expanduser().resolve()
@@ -1238,27 +1473,116 @@ def narrate_video(args: argparse.Namespace) -> dict:
     manifest.status = "running"
     manifest.save(manifest_path)
 
+    # --- Phase 1: Frame extraction + vision analysis for all segments ---
+    needs_narration: list[SegmentState] = []
     for segment in manifest.segments:
         if not should_process_segment(segment, redo=args.redo, target_segment_ids=target_segment_ids):
             continue
+        if not run_boundary_step(manifest, segment, manifest_path=manifest_path):
+            continue
+        try:
+            if segment.status == SegmentStatus.PENDING:
+                run_frame_extraction_step(
+                    segment,
+                    input_video=input_video,
+                    frames_dir=frames_dir,
+                    ffmpeg_bin=ffmpeg_bin,
+                )
+                manifest.save(manifest_path)
+            if segment.status == SegmentStatus.FRAMES_EXTRACTED:
+                run_vision_step(manifest, segment)
+                manifest.save(manifest_path)
+                needs_narration.append(segment)
+            elif segment.status in (
+                SegmentStatus.CONTENT_GENERATED,
+                SegmentStatus.TTS_GENERATED,
+            ):
+                needs_narration.append(segment)
+        except Exception as exc:
+            segment.status = SegmentStatus.FAILED
+            segment.errors.append(str(exc))
+            manifest.save(manifest_path)
+            raise
 
-        process_segment(
-            manifest,
-            segment,
-            input_video=input_video,
-            frames_dir=frames_dir,
-            raw_audio_dir=raw_audio_dir,
-            fit_audio_dir=fit_audio_dir,
-            ffmpeg_bin=ffmpeg_bin,
-            ffprobe_bin=ffprobe_bin,
-            args=args,
-            manifest_path=manifest_path,
-        )
+    # --- Pass 0: Generate global narrative outline ---
+    if not skip_coherence and not manifest.narrative_outline and needs_narration:
+        has_vision = any(seg.title for seg in manifest.segments)
+        if has_vision:
+            try:
+                manifest.narrative_outline = generate_narrative_outline(manifest)
+                print(f"[outline] Generated global narrative outline ({len(manifest.narrative_outline)} chars)")
+                manifest.save(manifest_path)
+            except Exception as exc:
+                print(f"[outline] Warning: outline generation failed ({exc}), continuing without outline")
+
+    # --- Phase 2: Narration + QA + TTS for each segment ---
+    for segment in needs_narration:
+        try:
+            if segment.status == SegmentStatus.FRAMES_EXTRACTED:
+                run_narration_step(manifest, segment)
+                manifest.save(manifest_path)
+                run_qa_gate_step(manifest, segment)
+                manifest.save(manifest_path)
+
+            if segment.status == SegmentStatus.CONTENT_GENERATED:
+                style_policy = get_effective_style_policy(manifest)
+                run_tts_step(
+                    segment,
+                    raw_audio_dir=raw_audio_dir,
+                    fit_audio_dir=fit_audio_dir,
+                    ffmpeg_bin=ffmpeg_bin,
+                    ffprobe_bin=ffprobe_bin,
+                    base_rate=style_policy["base_rate"],
+                    azure_style=style_policy["azure_style"],
+                    segment_buffer=args.segment_buffer,
+                )
+                manifest.save(manifest_path)
+
+            if segment.status == SegmentStatus.TTS_GENERATED:
+                run_duration_gate_step(segment)
+                manifest.save(manifest_path)
+
+        except Exception as exc:
+            segment.status = SegmentStatus.FAILED
+            segment.errors.append(str(exc))
+            manifest.save(manifest_path)
+            raise
 
         print(
             f"[segment {segment.id:03d}] {segment.start:.2f}-{segment.end:.2f}s | "
             f"status={segment.status.value} decision={(segment.decision.value if segment.decision else 'none')}"
         )
+
+    # --- Pass 2: Coherence polish + re-TTS ---
+    if not skip_coherence and target_segment_ids is None:
+        try:
+            revised = polish_narrations_for_coherence(manifest)
+            if revised:
+                print(f"[coherence] Polished {revised} segment(s) for coherence")
+                manifest.save(manifest_path)
+                # Re-synthesize TTS for polished segments
+                for segment in manifest.segments:
+                    if segment.status == SegmentStatus.CONTENT_GENERATED and segment.selected_draft:
+                        try:
+                            style_policy = get_effective_style_policy(manifest)
+                            run_tts_step(
+                                segment,
+                                raw_audio_dir=raw_audio_dir,
+                                fit_audio_dir=fit_audio_dir,
+                                ffmpeg_bin=ffmpeg_bin,
+                                ffprobe_bin=ffprobe_bin,
+                                base_rate=style_policy["base_rate"],
+                                azure_style=style_policy["azure_style"],
+                                segment_buffer=args.segment_buffer,
+                            )
+                            if segment.status == SegmentStatus.TTS_GENERATED:
+                                run_duration_gate_step(segment)
+                            manifest.save(manifest_path)
+                        except Exception as exc:
+                            segment.errors.append(f"coherence re-tts failed: {exc}")
+                            manifest.save(manifest_path)
+        except Exception as exc:
+            print(f"[coherence] Warning: coherence polish failed ({exc}), using original narrations")
 
     return finalize_outputs(manifest, ffmpeg_bin=ffmpeg_bin, output_video=output_video, workdir=workdir)
 
@@ -1317,6 +1641,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--force-replan",
         action="store_true",
         help="Ignore existing manifest in workdir and rebuild segment plan",
+    )
+    parser.add_argument(
+        "--skip-coherence",
+        action="store_true",
+        help="Skip the narrative outline (Pass 0) and coherence polish (Pass 2) steps",
     )
     parser.add_argument(
         "--graph",

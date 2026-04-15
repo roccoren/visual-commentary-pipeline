@@ -191,6 +191,7 @@ class Manifest:
     azure_style: str
     duration: float
     video_profile: VideoProfile | None = None
+    narrative_outline: str = ""
     status: str = "initialized"
     artifacts: dict[str, str] = field(default_factory=dict)
     segments: list[SegmentState] = field(default_factory=list)
@@ -209,6 +210,7 @@ class Manifest:
             "azure_style": self.azure_style,
             "duration": self.duration,
             "video_profile": self.video_profile.to_dict() if self.video_profile else None,
+            "narrative_outline": self.narrative_outline,
             "status": self.status,
             "artifacts": self.artifacts,
             "segments": [segment.to_dict() for segment in self.segments],
@@ -229,6 +231,7 @@ class Manifest:
             azure_style=str(data["azure_style"]),
             duration=float(data["duration"]),
             video_profile=VideoProfile.from_dict(data["video_profile"]) if data.get("video_profile") else None,
+            narrative_outline=str(data.get("narrative_outline", "")),
             status=str(data.get("status", "initialized")),
             artifacts=dict(data.get("artifacts", {})),
             segments=[SegmentState.from_dict(item) for item in data.get("segments", [])],

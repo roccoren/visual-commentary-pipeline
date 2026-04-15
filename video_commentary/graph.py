@@ -620,6 +620,71 @@ def process_segments(state: PipelineState) -> dict[str, Any]:
     return {"manifest_dict": manifest.to_dict()}
 
 
+def coherence_step(state: PipelineState) -> dict[str, Any]:
+    """Generate narrative outline and polish narrations for coherence.
+
+    Runs Pass 0 (outline) if not already generated, and Pass 2 (polish)
+    on all accepted narrations. Skipped when --skip-coherence is set or
+    when processing individual segments.
+    """
+    from .pipeline import (
+        generate_narrative_outline,
+        get_effective_style_policy,
+        polish_narrations_for_coherence,
+        run_duration_gate_step,
+        run_tts_step,
+    )
+
+    args_dict = state.get("args_dict", {})
+    skip_coherence = args_dict.get("skip_coherence", False)
+    target_ids = state.get("target_segment_ids")
+
+    if skip_coherence or target_ids:
+        return {}
+
+    manifest = _manifest_from_state(state)
+
+    # Pass 0: Generate outline if missing
+    if not manifest.narrative_outline:
+        has_vision = any(seg.title for seg in manifest.segments)
+        if has_vision:
+            try:
+                manifest.narrative_outline = generate_narrative_outline(manifest)
+                print(f"[outline] Generated global narrative outline ({len(manifest.narrative_outline)} chars)")
+            except Exception as exc:
+                print(f"[outline] Warning: outline generation failed ({exc})")
+
+    # Pass 2: Polish narrations
+    try:
+        revised = polish_narrations_for_coherence(manifest)
+        if revised:
+            print(f"[coherence] Polished {revised} segment(s) for coherence")
+            # Re-synthesize TTS for polished segments
+            workdir = Path(state["workdir"])
+            for segment in manifest.segments:
+                if segment.status == SegmentStatus.CONTENT_GENERATED and segment.selected_draft:
+                    try:
+                        style_policy = get_effective_style_policy(manifest)
+                        run_tts_step(
+                            segment,
+                            raw_audio_dir=workdir / "tts_raw",
+                            fit_audio_dir=workdir / "tts_fit",
+                            ffmpeg_bin=state["ffmpeg_bin"],
+                            ffprobe_bin=state["ffprobe_bin"],
+                            base_rate=style_policy["base_rate"],
+                            azure_style=style_policy["azure_style"],
+                            segment_buffer=manifest.segment_buffer,
+                        )
+                        if segment.status == SegmentStatus.TTS_GENERATED:
+                            run_duration_gate_step(segment)
+                    except Exception as exc:
+                        segment.errors.append(f"coherence re-tts failed: {exc}")
+    except Exception as exc:
+        print(f"[coherence] Warning: coherence polish failed ({exc})")
+
+    return _save_manifest(state, manifest)
+
+
 def finalize_pipeline(state: PipelineState) -> dict[str, Any]:
     """Compose audio, mux video, write SRT, and update manifest."""
     from .pipeline import finalize_outputs
@@ -643,17 +708,19 @@ def build_pipeline_graph() -> StateGraph:
 
     Flow::
 
-        init_pipeline → process_segments → finalize → END
+        init_pipeline → process_segments → coherence → finalize → END
     """
     builder = StateGraph(PipelineState)
 
     builder.add_node("init", init_pipeline)
     builder.add_node("process_segments", process_segments)
+    builder.add_node("coherence", coherence_step)
     builder.add_node("finalize", finalize_pipeline)
 
     builder.add_edge(START, "init")
     builder.add_edge("init", "process_segments")
-    builder.add_edge("process_segments", "finalize")
+    builder.add_edge("process_segments", "coherence")
+    builder.add_edge("coherence", "finalize")
     builder.add_edge("finalize", END)
 
     return builder
