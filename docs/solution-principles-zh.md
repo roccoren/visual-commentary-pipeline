@@ -71,6 +71,20 @@ flowchart TD
 
 ## 3. 端到端工作流
 
+### 3.0 当前工程化工作流（stateful workflow）
+
+当前版本已经不是单次跑完就结束的脚本，而是一个 **manifest 驱动的 stateful workflow**。
+
+它的核心流程可以概括为：
+
+1. 先规划 segment，并把初始状态写入 manifest。
+2. 每个 segment 按状态推进：抽帧 → 视觉理解 → narration → QA gate → 最多一次自动 rewrite → TTS → duration gate。
+3. 每一步都把状态、decision、reason、retry history 写回 manifest。
+4. 最终 accepted segment 不是靠进程内临时列表，而是从 manifest 重建 narration、字幕和混合音轨。
+5. 当个别片段有问题时，可以通过 resume / redo 只重做某一段，而不必整视频重跑。
+
+这意味着工程上的“真相源”已经从一次性内存态，转成了持久化的 `commentary_manifest.json`。
+
 ### 3.1 视频时长探测
 
 系统首先通过 `ffprobe` 获取输入视频总时长。这个总时长是后续所有时间窗计算的基准，包括：
