@@ -23,7 +23,9 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from .azure_auth import azure_openai_auth_headers
 from .core import normalize_terms
+from .qa_gate import QAConfig
 from .state import Decision, SegmentState
 
 
@@ -126,14 +128,14 @@ def _call_llm_json(
     import requests as _requests
 
     endpoint = os.getenv("AZURE_OPENAI_ENDPOINT", "").rstrip("/")
-    api_key = os.getenv("AZURE_OPENAI_API_KEY", "")
+    api_key = os.getenv("AZURE_OPENAI_API_KEY") or None
     deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT", "")
     api_version = os.getenv("AZURE_OPENAI_API_VERSION", "2024-10-21")
 
-    if not all([endpoint, api_key, deployment]):
+    if not all([endpoint, deployment]):
         raise RuntimeError(
-            "LLM critic requires AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_KEY, "
-            "and AZURE_OPENAI_DEPLOYMENT environment variables"
+            "LLM critic requires AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_DEPLOYMENT "
+            "environment variables (AZURE_OPENAI_API_KEY is optional when using MSI)"
         )
 
     url = (
@@ -146,13 +148,13 @@ def _call_llm_json(
             {"role": "user", "content": user_prompt},
         ],
         "temperature": 0.3,
-        "max_tokens": 1200,
+        "max_completion_tokens": 1200,
         "response_format": {"type": "json_object"},
     }
 
     response = _requests.post(
         url,
-        headers={"api-key": api_key, "Content-Type": "application/json"},
+        headers={**azure_openai_auth_headers(api_key), "Content-Type": "application/json"},
         json=payload,
         timeout=120,
     )
@@ -180,6 +182,7 @@ def evaluate_narration_llm(
     previous_narration: str,
     visible_points: list[str] | None = None,
     on_screen_text: list[str] | None = None,
+    qa_config: QAConfig | None = None,
 ) -> CriticResult:
     """Evaluate narration quality using an LLM critic.
 
@@ -195,13 +198,16 @@ def evaluate_narration_llm(
         Visual elements detected on screen.
     on_screen_text:
         Text detected on screen.
+    qa_config:
+        Optional QA thresholds (uses defaults when *None*).
 
     Returns
     -------
     CriticResult
         Structured evaluation with pass/fail, issues, and feedback.
     """
-    max_chars = max(18, min(90, int(segment.duration * 8)))
+    cfg = qa_config or QAConfig()
+    max_chars = cfg.max_chars(segment.duration)
     chars_per_second = len(narration.strip()) / max(segment.duration, 0.1)
 
     user_prompt = textwrap.dedent(f"""\
@@ -249,6 +255,7 @@ def rewrite_narration_llm(
     previous_narration: str,
     visible_points: list[str] | None = None,
     on_screen_text: list[str] | None = None,
+    qa_config: QAConfig | None = None,
 ) -> RewriteResult:
     """Rewrite narration using an LLM guided by critic feedback.
 
@@ -266,13 +273,16 @@ def rewrite_narration_llm(
         Visual elements detected on screen.
     on_screen_text:
         Text detected on screen.
+    qa_config:
+        Optional QA thresholds (uses defaults when *None*).
 
     Returns
     -------
     RewriteResult
         The rewritten narration with change descriptions.
     """
-    max_chars = max(18, min(90, int(segment.duration * 8)))
+    cfg = qa_config or QAConfig()
+    max_chars = cfg.max_chars(segment.duration)
 
     issues_text = "\n".join(
         f"  - [{issue.severity}] {issue.category}: {issue.description} → 建议: {issue.suggestion}"
@@ -330,6 +340,7 @@ def evaluate_narration_two_layer(
     segment: SegmentState,
     previous_narration: str,
     use_llm: bool = True,
+    qa_config: QAConfig | None = None,
 ) -> tuple[bool, Decision, str, list[str], CriticResult | None]:
     """Two-layer QA evaluation: rule-based first, then LLM if rules pass.
 
@@ -339,11 +350,14 @@ def evaluate_narration_two_layer(
     """
     from .qa_gate import evaluate_narration_quality
 
+    cfg = qa_config or QAConfig()
+
     # Layer 1: rule-based (fast, free)
     rule_result = evaluate_narration_quality(
         narration=narration,
         previous_narration=previous_narration,
         duration_seconds=segment.duration,
+        qa_config=cfg,
     )
 
     if not rule_result.passed:
@@ -363,6 +377,7 @@ def evaluate_narration_two_layer(
         narration=narration,
         segment=segment,
         previous_narration=previous_narration,
+        qa_config=cfg,
     )
 
     if critic.passed or critic.confidence == 0.0:
@@ -372,7 +387,10 @@ def evaluate_narration_two_layer(
     # LLM found issues
     high_severity = any(i.severity == "high" for i in critic.issues)
     feedback = [f"llm_critic: {i.category} - {i.description}" for i in critic.issues]
-    decision = Decision.NEEDS_HUMAN_REVIEW if high_severity else Decision.RETRY_NARRATION
+    if cfg.critic_lenient or not high_severity:
+        decision = Decision.RETRY_NARRATION
+    else:
+        decision = Decision.NEEDS_HUMAN_REVIEW
     return (
         False,
         decision,

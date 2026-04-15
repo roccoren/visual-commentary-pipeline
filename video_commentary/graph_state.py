@@ -40,6 +40,9 @@ class SegmentProcessingState(TypedDict, total=False):
     use_llm_critic: bool
     use_doc_intel: bool
 
+    # QA tuning (serialised QAConfig dict)
+    qa_config: dict[str, Any]
+
     # Control flow signals set by gate nodes
     boundary_ok: bool
     qa_passed: bool
@@ -81,6 +84,9 @@ class PipelineState(TypedDict, total=False):
     use_llm_critic: bool
     use_doc_intel: bool
     use_llm_profiler: bool
+
+    # QA tuning (serialised QAConfig dict)
+    qa_config: dict[str, Any]
 
     # Segment processing tracking
     current_segment_index: int

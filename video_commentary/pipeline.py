@@ -35,8 +35,9 @@ from .core import (
 )
 from .duration_policy import decide_duration_action
 from .planner import VideoProfile, normalize_video_profile, plan_video_profile
-from .qa_gate import evaluate_narration_quality
+from .qa_gate import QAConfig, evaluate_narration_quality
 from .segment_policy import decide_segment_action
+from .azure_auth import azure_openai_auth_headers, cognitive_services_auth_headers, get_bearer_token
 from .state import Decision, Manifest, RetryEntry, SegmentState, SegmentStatus
 
 DEFAULT_AZURE_OPENAI_API_VERSION = "2024-10-21"
@@ -198,7 +199,7 @@ def build_azure_openai_vision_request(
             {"role": "user", "content": content},
         ],
         "temperature": 0.2,
-        "max_tokens": 900,
+        "max_completion_tokens": 900,
     }
     return (
         f"{endpoint}/openai/deployments/{deployment}/chat/completions?api-version={api_version}",
@@ -325,7 +326,7 @@ def generate_narrative_outline(manifest: Manifest) -> str:
     ).strip()
 
     endpoint = env_required("AZURE_OPENAI_ENDPOINT").rstrip("/")
-    api_key = env_required("AZURE_OPENAI_API_KEY")
+    api_key = os.getenv("AZURE_OPENAI_API_KEY")
     deployment = env_required("AZURE_OPENAI_DEPLOYMENT")
     api_version = os.getenv("AZURE_OPENAI_API_VERSION", DEFAULT_AZURE_OPENAI_API_VERSION)
 
@@ -335,13 +336,13 @@ def generate_narrative_outline(manifest: Manifest) -> str:
             {"role": "user", "content": prompt},
         ],
         "temperature": 0.3,
-        "max_tokens": 1200,
+        "max_completion_tokens": 1200,
     }
 
     url = f"{endpoint}/openai/deployments/{deployment}/chat/completions?api-version={api_version}"
     response = requests.post(
         url,
-        headers={"api-key": api_key, "Content-Type": "application/json"},
+        headers={**azure_openai_auth_headers(api_key), "Content-Type": "application/json"},
         json=payload,
         timeout=120,
     )
@@ -430,7 +431,7 @@ def polish_narrations_for_coherence(manifest: Manifest) -> int:
     ).strip()
 
     endpoint = env_required("AZURE_OPENAI_ENDPOINT").rstrip("/")
-    api_key = env_required("AZURE_OPENAI_API_KEY")
+    api_key = os.getenv("AZURE_OPENAI_API_KEY")
     deployment = env_required("AZURE_OPENAI_DEPLOYMENT")
     api_version = os.getenv("AZURE_OPENAI_API_VERSION", DEFAULT_AZURE_OPENAI_API_VERSION)
 
@@ -440,13 +441,13 @@ def polish_narrations_for_coherence(manifest: Manifest) -> int:
             {"role": "user", "content": prompt},
         ],
         "temperature": 0.2,
-        "max_tokens": 2000,
+        "max_completion_tokens": 2000,
     }
 
     url = f"{endpoint}/openai/deployments/{deployment}/chat/completions?api-version={api_version}"
     response = requests.post(
         url,
-        headers={"api-key": api_key, "Content-Type": "application/json"},
+        headers={**azure_openai_auth_headers(api_key), "Content-Type": "application/json"},
         json=payload,
         timeout=180,
     )
@@ -488,7 +489,7 @@ def polish_narrations_for_coherence(manifest: Manifest) -> int:
 
 def call_azure_openai_vision(*, frame_paths: List[Path], segment: SegmentState, previous_narration: str, style_policy: dict[str, str] | None = None, narrative_outline: str = "", context_window: str = "") -> dict:
     endpoint = env_required("AZURE_OPENAI_ENDPOINT").rstrip("/")
-    api_key = env_required("AZURE_OPENAI_API_KEY")
+    api_key = os.getenv("AZURE_OPENAI_API_KEY")
     deployment = env_required("AZURE_OPENAI_DEPLOYMENT")
     api_version = os.getenv("AZURE_OPENAI_API_VERSION", DEFAULT_AZURE_OPENAI_API_VERSION)
 
@@ -546,7 +547,7 @@ def call_azure_openai_vision(*, frame_paths: List[Path], segment: SegmentState, 
     )
     response = requests.post(
         url,
-        headers={"api-key": api_key, "Content-Type": "application/json"},
+        headers={**azure_openai_auth_headers(api_key), "Content-Type": "application/json"},
         json=payload,
         timeout=180,
     )
@@ -573,15 +574,18 @@ def call_azure_openai_vision(*, frame_paths: List[Path], segment: SegmentState, 
 
 
 def azure_speech_token() -> str:
-    key = env_required("AZURE_SPEECH_KEY")
-    region = env_required("AZURE_SPEECH_REGION")
-    response = requests.post(
-        f"https://{region}.api.cognitive.microsoft.com/sts/v1.0/issueToken",
-        headers={"Ocp-Apim-Subscription-Key": key},
-        timeout=30,
-    )
-    response.raise_for_status()
-    return response.text
+    key = os.getenv("AZURE_SPEECH_KEY")
+    if key:
+        region = env_required("AZURE_SPEECH_REGION")
+        response = requests.post(
+            f"https://{region}.api.cognitive.microsoft.com/sts/v1.0/issueToken",
+            headers={"Ocp-Apim-Subscription-Key": key},
+            timeout=30,
+        )
+        response.raise_for_status()
+        return response.text
+    # MSI fallback — obtain a token directly from DefaultAzureCredential
+    return get_bearer_token()
 
 
 def synthesize_azure_tts(
@@ -1077,7 +1081,9 @@ def rewrite_narration_once(
     decision_reason: str,
     duration_seconds: float,
     previous_narration: str,
+    qa_config: QAConfig | None = None,
 ) -> str:
+    cfg = qa_config or QAConfig()
     rewritten = narration.strip()
     if "empty narration" in critic_feedback or not rewritten:
         rewritten = "这里继续展示当前步骤的关键内容。"
@@ -1092,7 +1098,7 @@ def rewrite_narration_once(
         if not rewritten:
             rewritten = "这里继续说明当前部分的核心内容。"
     elif "too long or too dense narration" in critic_feedback:
-        max_chars = max(18, min(90, int(duration_seconds * 8)))
+        max_chars = cfg.max_chars(duration_seconds)
         rewritten = rewritten[:max_chars].rstrip("，、；： ")
         if not rewritten:
             rewritten = "这里继续展示当前步骤。"
@@ -1672,10 +1678,47 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Use LLM vision analysis for video type profiling (requires --graph)",
     )
+
+    # QA tuning knobs
+    qa_group = parser.add_argument_group("QA thresholds", "Fine-tune narration quality gate behaviour")
+    qa_group.add_argument(
+        "--max-cps-soft",
+        type=float,
+        default=8.5,
+        help="chars/second soft limit — exceeding triggers retry (default: 8.5)",
+    )
+    qa_group.add_argument(
+        "--max-cps-hard",
+        type=float,
+        default=12.0,
+        help="chars/second hard limit — exceeding triggers human review (default: 12.0)",
+    )
+    qa_group.add_argument(
+        "--density-factor",
+        type=int,
+        default=8,
+        help="Factor for max_chars = max(18, min(90, duration * factor)) (default: 8)",
+    )
+    qa_group.add_argument(
+        "--max-narration-retries",
+        type=int,
+        default=None,
+        help="Max LLM rewrite attempts per segment (default: 2 with --use-llm-critic, 1 without)",
+    )
+    qa_group.add_argument(
+        "--critic-lenient",
+        action="store_true",
+        help="Treat high-severity critic issues as retryable instead of requiring human review",
+    )
+
     return parser
 
 
 def main(argv: List[str] | None = None) -> int:
+    from dotenv import load_dotenv
+
+    load_dotenv()
+
     parser = build_arg_parser()
     args = parser.parse_args(argv)
     if args.graph:

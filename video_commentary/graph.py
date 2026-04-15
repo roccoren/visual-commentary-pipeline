@@ -192,6 +192,9 @@ def qa_gate_step(state: SegmentProcessingState) -> dict[str, Any]:
 
     # Two-layer QA with LLM critic
     from .llm_critic import evaluate_narration_two_layer, rewrite_narration_llm
+    from .qa_gate import QAConfig
+
+    qa_config = QAConfig.from_dict(state.get("qa_config", {})) if state.get("qa_config") else QAConfig()
 
     previous_narration = get_previous_accepted_narration(manifest, state["segment_id"])
     max_retries = state.get("max_narration_retries", 2)
@@ -202,6 +205,7 @@ def qa_gate_step(state: SegmentProcessingState) -> dict[str, Any]:
         segment=segment,
         previous_narration=previous_narration,
         use_llm=True,
+        qa_config=qa_config,
     )
 
     if passed:
@@ -223,6 +227,7 @@ def qa_gate_step(state: SegmentProcessingState) -> dict[str, Any]:
             segment=segment,
             critic_result=critic_result,
             previous_narration=previous_narration,
+            qa_config=qa_config,
         )
 
         if rewrite_result.confidence > 0.0:
@@ -237,6 +242,7 @@ def qa_gate_step(state: SegmentProcessingState) -> dict[str, Any]:
                 segment=segment,
                 previous_narration=previous_narration,
                 use_llm=True,
+                qa_config=qa_config,
             )
             segment.critic_feedback = feedback2
             note_segment_decision(
@@ -409,6 +415,17 @@ def init_pipeline(state: PipelineState) -> dict[str, Any]:
     use_doc_intel = getattr(args, "use_doc_intel", False)
     use_llm_profiler = getattr(args, "use_llm_profiler", False)
 
+    # Build QAConfig from CLI args
+    from .qa_gate import QAConfig
+
+    qa_config = QAConfig(
+        max_cps_soft=getattr(args, "max_cps_soft", 8.5),
+        max_cps_hard=getattr(args, "max_cps_hard", 12.0),
+        density_factor=getattr(args, "density_factor", 8),
+        max_narration_retries=getattr(args, "max_narration_retries", None),
+        critic_lenient=getattr(args, "critic_lenient", False),
+    )
+
     cu_result: dict[str, Any] = {}
 
     # Phase 2: Content Understanding analysis (if enabled and creating new manifest)
@@ -539,6 +556,7 @@ def init_pipeline(state: PipelineState) -> dict[str, Any]:
         "use_llm_critic": use_llm_critic,
         "use_doc_intel": use_doc_intel,
         "use_llm_profiler": use_llm_profiler,
+        "qa_config": qa_config.to_dict(),
         "segments_total": len(manifest.segments),
         "current_segment_index": 0,
         "target_segment_ids": sorted(target_segment_ids) if target_segment_ids else None,
@@ -574,6 +592,13 @@ def process_segments(state: PipelineState) -> dict[str, Any]:
         if not should_process_segment(segment, redo=state.get("redo"), target_segment_ids=target_ids):
             continue
 
+        qa_cfg = state.get("qa_config", {})
+        explicit_retries = qa_cfg.get("max_narration_retries")
+        if explicit_retries is not None:
+            max_retries = explicit_retries
+        else:
+            max_retries = 2 if state.get("use_llm_critic", False) else 1
+
         seg_input: SegmentProcessingState = {
             "segment_id": segment.id,
             "manifest_dict": manifest.to_dict(),
@@ -593,6 +618,8 @@ def process_segments(state: PipelineState) -> dict[str, Any]:
             "use_llm_critic": state.get("use_llm_critic", False),
             "use_doc_intel": state.get("use_doc_intel", False),
             "cu_segment_data": {},
+            # QA tuning
+            "qa_config": qa_cfg,
             # Control flow
             "boundary_ok": True,
             "qa_passed": False,
@@ -600,7 +627,7 @@ def process_segments(state: PipelineState) -> dict[str, Any]:
             "tts_retry_count": 0,
             "narration_retry_count": 0,
             "max_tts_retries": 1,
-            "max_narration_retries": 2 if state.get("use_llm_critic", False) else 1,
+            "max_narration_retries": max_retries,
             "segment_status": segment.status.value,
             "error": "",
         }

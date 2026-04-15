@@ -23,6 +23,7 @@ from typing import Any
 
 import requests
 
+from .azure_auth import azure_openai_auth_headers, cognitive_services_auth_headers
 from .core import normalize_terms
 from .planner import (
     ALLOWED_VIDEO_TYPES,
@@ -64,10 +65,10 @@ def analyze_document_ocr(
         ``words`` — list of dicts with ``text`` and ``confidence``.
     """
     endpoint = os.getenv("AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT", "").rstrip("/")
-    api_key = os.getenv("AZURE_DOCUMENT_INTELLIGENCE_KEY", "")
+    api_key = os.getenv("AZURE_DOCUMENT_INTELLIGENCE_KEY") or None
 
-    if not endpoint or not api_key:
-        return {"text": "", "lines": [], "words": [], "error": "credentials not configured"}
+    if not endpoint:
+        return {"text": "", "lines": [], "words": [], "error": "endpoint not configured"}
 
     mime = "image/jpeg" if image_path.suffix.lower() in {".jpg", ".jpeg"} else "image/png"
 
@@ -76,7 +77,7 @@ def analyze_document_ocr(
     response = requests.post(
         url,
         headers={
-            "Ocp-Apim-Subscription-Key": api_key,
+            **cognitive_services_auth_headers(api_key),
             "Content-Type": mime,
         },
         data=image_path.read_bytes(),
@@ -92,7 +93,7 @@ def analyze_document_ocr(
             time.sleep(2)
             poll = requests.get(
                 operation_url,
-                headers={"Ocp-Apim-Subscription-Key": api_key},
+                headers=cognitive_services_auth_headers(api_key),
                 timeout=30,
             )
             poll.raise_for_status()
@@ -161,11 +162,11 @@ def profile_video_with_llm(
         Profile with video_type, confidence, policies, and rationale.
     """
     endpoint = os.getenv("AZURE_OPENAI_ENDPOINT", "").rstrip("/")
-    api_key = os.getenv("AZURE_OPENAI_API_KEY", "")
+    api_key = os.getenv("AZURE_OPENAI_API_KEY") or None
     deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT", "")
     api_version = os.getenv("AZURE_OPENAI_API_VERSION", "2024-10-21")
 
-    if not all([endpoint, api_key, deployment]) or not frame_paths:
+    if not all([endpoint, deployment]) or not frame_paths:
         return _fallback_profile(
             requested_scene_threshold=requested_scene_threshold,
             requested_min_segment=requested_min_segment,
@@ -215,7 +216,7 @@ def profile_video_with_llm(
             {"role": "user", "content": content},
         ],
         "temperature": 0.2,
-        "max_tokens": 600,
+        "max_completion_tokens": 600,
         "response_format": {"type": "json_object"},
     }
 
@@ -223,7 +224,7 @@ def profile_video_with_llm(
     try:
         response = requests.post(
             url,
-            headers={"api-key": api_key, "Content-Type": "application/json"},
+            headers={**azure_openai_auth_headers(api_key), "Content-Type": "application/json"},
             json=payload,
             timeout=120,
         )

@@ -31,6 +31,7 @@ from typing import Any
 
 import requests
 
+from .azure_auth import cognitive_services_auth_headers
 from .core import Segment, build_segments, normalize_terms
 from .state import SegmentState, SegmentStatus
 
@@ -56,13 +57,9 @@ def _cu_endpoint() -> str:
     return endpoint
 
 
-def _cu_api_key() -> str:
-    key = os.getenv("AZURE_CONTENT_UNDERSTANDING_KEY", "")
-    if not key:
-        raise SystemExit(
-            "Missing required environment variable: AZURE_CONTENT_UNDERSTANDING_KEY"
-        )
-    return key
+def _cu_api_key() -> str | None:
+    """Return the Content Understanding API key, or ``None`` for MSI auth."""
+    return os.getenv("AZURE_CONTENT_UNDERSTANDING_KEY") or None
 
 
 # ---------------------------------------------------------------------------
@@ -134,7 +131,7 @@ def create_custom_analyzer(
     url = f"{endpoint}/contentunderstanding/analyzers/{analyzer_id}?api-version={api_version}"
     response = requests.put(
         url,
-        headers={"Ocp-Apim-Subscription-Key": api_key, "Content-Type": "application/json"},
+        headers={**cognitive_services_auth_headers(api_key), "Content-Type": "application/json"},
         json=analyzer_def,
         timeout=60,
     )
@@ -178,7 +175,7 @@ def analyze_video(
     analyzer = analyzer_id or DEFAULT_ANALYZER
 
     headers = {
-        "Ocp-Apim-Subscription-Key": api_key,
+        **cognitive_services_auth_headers(api_key),
         "Content-Type": "application/octet-stream",
     }
 
@@ -195,7 +192,7 @@ def analyze_video(
         return response.json()
 
     # Poll for completion
-    poll_headers = {"Ocp-Apim-Subscription-Key": api_key}
+    poll_headers = cognitive_services_auth_headers(api_key)
     elapsed = 0.0
     while elapsed < max_wait:
         time.sleep(poll_interval)

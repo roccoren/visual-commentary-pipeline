@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
+from typing import Any
 
 EXPLICIT_TRANSITION_BANNED_TOKENS = (
     "上一页",
@@ -13,6 +14,36 @@ EXPLICIT_TRANSITION_BANNED_TOKENS = (
 )
 
 from .state import Decision
+
+
+@dataclass
+class QAConfig:
+    """Tunable QA thresholds — surfaced as CLI flags."""
+
+    max_cps_soft: float = 8.5
+    """chars/second soft limit → RETRY_NARRATION."""
+    max_cps_hard: float = 12.0
+    """chars/second hard limit → NEEDS_HUMAN_REVIEW."""
+    density_factor: int = 8
+    """Factor in ``max_chars = max(18, min(90, int(duration * factor)))``."""
+    max_narration_retries: int | None = None
+    """Max LLM rewrite attempts per segment (None = auto: 2 with critic, 1 without)."""
+    critic_lenient: bool = False
+    """When True, high-severity critic issues trigger RETRY instead of NEEDS_HUMAN_REVIEW."""
+
+    def max_chars(self, duration_seconds: float) -> int:
+        """Compute the maximum character count for a segment."""
+        return max(18, min(90, int(duration_seconds * self.density_factor)))
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> QAConfig:
+        return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
+
+
+_DEFAULT_QA_CONFIG = QAConfig()
 
 
 @dataclass
@@ -33,13 +64,15 @@ def evaluate_narration_quality(
     narration: str,
     previous_narration: str,
     duration_seconds: float,
+    qa_config: QAConfig | None = None,
 ) -> QAGateResult:
+    cfg = qa_config or _DEFAULT_QA_CONFIG
     cleaned = narration.strip()
     normalized = _normalize_for_compare(cleaned)
     previous_normalized = _normalize_for_compare(previous_narration)
     char_count = len(cleaned)
     chars_per_second = char_count / max(duration_seconds, 0.1)
-    max_chars = max(18, min(90, int(duration_seconds * 8)))
+    max_chars = cfg.max_chars(duration_seconds)
 
     if not normalized:
         return QAGateResult(
@@ -73,7 +106,7 @@ def evaluate_narration_quality(
             },
         )
 
-    if char_count > max_chars * 1.5 or chars_per_second > 12.0:
+    if char_count > max_chars * 1.5 or chars_per_second > cfg.max_cps_hard:
         return QAGateResult(
             passed=False,
             decision=Decision.NEEDS_HUMAN_REVIEW,
@@ -87,7 +120,7 @@ def evaluate_narration_quality(
             },
         )
 
-    if char_count > max_chars or chars_per_second > 8.5:
+    if char_count > max_chars or chars_per_second > cfg.max_cps_soft:
         return QAGateResult(
             passed=False,
             decision=Decision.RETRY_NARRATION,
