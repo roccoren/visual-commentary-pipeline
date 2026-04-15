@@ -41,6 +41,8 @@ pip install -e .[dev]
 
 ### Azure OpenAI
 
+Used for vision understanding and narration generation (always required).
+
 ```bash
 export AZURE_OPENAI_ENDPOINT="https://<resource>.openai.azure.com"
 export AZURE_OPENAI_API_KEY="..."
@@ -51,6 +53,8 @@ export AZURE_OPENAI_API_VERSION="2024-10-21"
 
 ### Azure Speech
 
+Used for TTS synthesis (always required).
+
 ```bash
 export AZURE_SPEECH_KEY="..."
 export AZURE_SPEECH_REGION="eastus"
@@ -58,22 +62,33 @@ export AZURE_SPEECH_REGION="eastus"
 export AZURE_SPEECH_VOICE="zh-CN-XiaoxiaoNeural"
 ```
 
-## Run
+### Azure Content Understanding (optional — `--use-content-understanding`)
+
+Replaces ffmpeg scene detection with model-driven video analysis.
 
 ```bash
-python scripts/visual_commentary_pipeline.py \
-  --input input.mp4 \
-  --output out/commentary_zh.mp4 \
-  --workdir out/work \
-  --scene-threshold 0.32 \
-  --min-segment 3 \
-  --max-segment 12 \
-  --segment-buffer 0.35 \
-  --base-rate "+0%" \
-  --azure-style professional
+export AZURE_CONTENT_UNDERSTANDING_ENDPOINT="https://<resource>.cognitiveservices.azure.com"
+export AZURE_CONTENT_UNDERSTANDING_KEY="..."
+# optional — defaults to 2025-11-01
+export AZURE_CU_API_VERSION="2025-11-01"
+# optional — model deployment for custom analyzer field extraction
+export AZURE_CU_MODEL_DEPLOYMENT="gpt-4o"
 ```
 
-Or install the console script and run:
+### Azure Document Intelligence (optional — `--use-doc-intel`)
+
+Provides precise OCR for UI screenshots in portal/dashboard videos.
+
+```bash
+export AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT="https://<resource>.cognitiveservices.azure.com"
+export AZURE_DOCUMENT_INTELLIGENCE_KEY="..."
+```
+
+> **Note:** The LLM critic (`--use-llm-critic`) and LLM profiler (`--use-llm-profiler`) reuse the Azure OpenAI credentials above — no additional environment variables are needed.
+
+## Run
+
+### Standard pipeline (ffmpeg-based)
 
 ```bash
 visual-commentary \
@@ -81,6 +96,30 @@ visual-commentary \
   --output out/commentary_zh.mp4 \
   --workdir out/work
 ```
+
+### Enhanced pipeline (LangGraph + Azure AI services)
+
+```bash
+visual-commentary \
+  --input input.mp4 \
+  --output out/commentary_zh.mp4 \
+  --workdir out/work \
+  --graph \
+  --use-content-understanding \
+  --use-llm-critic \
+  --use-doc-intel \
+  --use-llm-profiler
+```
+
+| Flag | What it does | Extra env vars needed |
+|------|-------------|----------------------|
+| `--graph` | Use LangGraph StateGraph orchestration | None |
+| `--use-content-understanding` | Azure Content Understanding for video analysis | `AZURE_CONTENT_UNDERSTANDING_*` |
+| `--use-llm-critic` | Two-layer QA: rules → LLM critic with rewrite loops | None (reuses Azure OpenAI) |
+| `--use-doc-intel` | Document Intelligence OCR for UI text | `AZURE_DOCUMENT_INTELLIGENCE_*` |
+| `--use-llm-profiler` | LLM vision-based video type profiling | None (reuses Azure OpenAI) |
+
+All enhanced flags are opt-in and default to off. Each degrades gracefully if its Azure credentials are missing.
 
 ## Workflow explanation
 
@@ -151,13 +190,20 @@ If a clip is still slightly too long, ffmpeg `atempo` is used as a fallback only
 - `video_commentary/state.py` — segment state, manifest, and decision enums
 - `video_commentary/segment_policy.py` — basic skip / merge boundary policy
 - `video_commentary/duration_policy.py` — duration-fit decision policy
+- `video_commentary/planner.py` — lightweight video type inference and policy defaults
 - `video_commentary/pipeline.py` — Azure + ffmpeg orchestrator loop with resume/regenerate
+- `video_commentary/graph.py` — LangGraph StateGraph orchestration (segment + pipeline graphs)
+- `video_commentary/graph_state.py` — TypedDict state definitions for the graph
+- `video_commentary/content_understanding.py` — Azure Content Understanding integration
+- `video_commentary/llm_critic.py` — LLM-powered QA critic and narration rewriter
+- `video_commentary/vision_enricher.py` — multi-model vision enrichment (CU + GPT-4o + Doc Intel)
 - `scripts/visual_commentary_pipeline.py` — runnable script entrypoint
 - `tests/test_video_commentary.py` — unit coverage for helpers + stateful workflow pieces
+- `tests/test_graph.py` — LangGraph orchestration tests
+- `tests/test_enhanced_pipeline.py` — tests for Content Understanding, LLM critic, and vision enricher
 
 ## Test
 
 ```bash
-pytest tests/test_video_commentary.py -q
-python scripts/visual_commentary_pipeline.py --help
+pytest tests/ -q
 ```
